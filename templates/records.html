@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="top"><a class="btn secondary" href="{{ url_for('index') }}">Back</a><h1 class="title">Cow Records</h1></div>
+  <div class="card">
+    <a class="btn" href="{{ url_for('export_xlsx') }}">Export to Excel</a>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Cow #</th><th>Litres</th><th>Date</th><th>Created</th></tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+          <tr>
+            <td>{{ r.id }}</td><td>{{ r.cow_number }}</td><td>{{ r.litres }}</td>
+            <td>{{ r.record_date }}</td><td>{{ r.created_at }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" style="color:var(--muted);">No records yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

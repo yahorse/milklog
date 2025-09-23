@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+# Set workdir inside the container
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Set environment variable for Flask
+ENV PORT=8080
+
+# Start Gunicorn when the container launches
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]

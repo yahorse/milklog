@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="card">
+    <h1 class="title">Milk Log</h1>
+    <div class="menu">
+      <a class="btn" href="{{ url_for('records') }}">Cow Records</a>
+      <a class="btn secondary" href="{{ url_for('new') }}">New Recording</a>
+    </div>
+  </div>
+  <p class="hint">Tip: Add this page to your home screen for one-tap access.</p>
+{% endblock %}
