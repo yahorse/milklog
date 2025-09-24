@@ -1,11 +1,10 @@
 # app.py
-# Milk Log – mobile-friendly Flask app for Render
-# - Enter Cow Number, Litres, Date
-# - Records view auto-creates a new column per date (same cow+date sums)
-# - Recent Entries list with per-row Delete (POST + confirm)
+# Milk Log – Flask app for Render with persistent SQLite
+# - Enter Cow Number, Litres, Date (YYYY-MM-DD)
+# - Records view: dynamic columns by date (same cow+date sums)
+# - Recent Entries with Delete
 # - Export to Excel (raw + pivot)
-# - Render persistence: uses /var/data if mounted; WAL mode enabled
-# - Optional secure backup route /backup.db?token=...
+# - WAL mode; DB created at import time so Gunicorn on Render works
 
 import os
 import io
@@ -17,19 +16,19 @@ from openpyxl import Workbook
 
 app = Flask(__name__)
 
-# ----------- Persistence (Render) -----------
+# ---------- Persistence (Render) ----------
 DATA_DIR = os.getenv("DATA_DIR", "/var/data")
 if not os.path.isdir(DATA_DIR):
+    # Fallback to local dir if disk not mounted; also ensure dir exists
     DATA_DIR = "."
-DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Optional backup token (set in Render env to enable /backup.db)
+DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
 BACKUP_TOKEN = os.getenv("BACKUP_TOKEN")
 
-# ----------- DB helpers -----------
+# ---------- DB helpers ----------
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        # Durability + concurrent reads
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("""
@@ -43,7 +42,8 @@ def init_db():
         """)
 
 def add_record(cow_number: str, litres: float, record_date_str: str):
-    _ = date.fromisoformat(record_date_str)  # validate date format
+    # validate date format
+    _ = date.fromisoformat(record_date_str)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
           INSERT INTO milk_records (cow_number, litres, record_date, created_at)
@@ -85,17 +85,11 @@ def get_last_n_dates(n:int):
           LIMIT ?
         """, (n,))
         dates = [r["record_date"] for r in cur.fetchall()]
-        return list(reversed(dates))  # show oldest -> newest left-to-right
+        return list(reversed(dates))  # left-to-right oldest -> newest
 
 def build_pivot_for_dates(dates):
-    """
-    Return (dates, rows) where:
-      dates: ['YYYY-MM-DD', ...]
-      rows: [{'cow':'2146','cells':[12,17,...],'total':29}, ...]
-    """
     if not dates:
         return [], []
-
     placeholders = ",".join("?" for _ in dates)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
@@ -107,14 +101,12 @@ def build_pivot_for_dates(dates):
         """, tuple(dates))
         data = cur.fetchall()
 
-    # Map: cow -> date -> litres
     by_cow = {}
     for r in data:
         cow = r["cow_number"]
         by_cow.setdefault(cow, {})
         by_cow[cow][r["record_date"]] = float(r["litres"] or 0)
 
-    # numeric-ish sort
     def cow_key(c):
         try:
             return (0, int(c))
@@ -127,7 +119,10 @@ def build_pivot_for_dates(dates):
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
     return dates, rows
 
-# ----------- Routes -----------
+# --- Ensure DB is ready at import time (important for Gunicorn/Render) ---
+init_db()
+
+# ---------- Routes ----------
 @app.route("/")
 def home():
     return render_template_string(TPL_HOME, base_css=BASE_CSS)
@@ -138,13 +133,11 @@ def new_record_screen():
 
 @app.route("/records")
 def records_screen():
-    # how many recent dates to show as columns
     try:
         last = int(request.args.get("last", "7"))
     except ValueError:
         last = 7
     last = max(1, min(last, 90))
-
     prev_last = max(1, last - 3)
     next_last = min(90, last + 3)
 
@@ -185,8 +178,12 @@ def add():
 
     try:
         add_record(cow, litres_val, record_date_str)
-    except Exception as e:
-        return f"Bad date. Use YYYY-MM-DD. ({e})", 400
+    except ValueError:
+        return "Bad date. Use YYYY-MM-DD.", 400
+    except sqlite3.OperationalError as e:
+        # If table somehow missing, re-init and ask user to retry
+        init_db()
+        return "Database was initialising. Please try again.", 503
 
     return redirect(url_for("new_record_screen"))
 
@@ -200,7 +197,6 @@ def export_excel():
     data = get_all_rows()
     wb = Workbook()
 
-    # Sheet 1: Raw data
     ws = wb.active
     ws.title = "Raw Records"
     ws.append(["ID", "Cow Number", "Litres", "Record Date", "Saved (UTC)"])
@@ -209,7 +205,6 @@ def export_excel():
     for col, w in zip("ABCDE", [8,12,10,12,25]):
         ws.column_dimensions[col].width = w
 
-    # Sheet 2: Pivot (last 7 dates)
     dates = get_last_n_dates(7)
     dates, rows = build_pivot_for_dates(dates)
     ws2 = wb.create_sheet("Pivot (last 7 dates)")
@@ -229,7 +224,6 @@ def export_excel():
 
 @app.route("/backup.db")
 def backup_db():
-    # Enable only if BACKUP_TOKEN is set in env and provided as ?token=
     if not BACKUP_TOKEN:
         return "Not enabled", 404
     if request.args.get("token") != BACKUP_TOKEN:
@@ -240,7 +234,7 @@ def backup_db():
 def healthz():
     return "ok", 200
 
-# ----------- Styles (passed into templates) -----------
+# ---------- Styles & Templates ----------
 BASE_CSS = """
 :root{
   --bg:#0b1220; --panel:#0f172a; --border:#1f2937; --text:#e5e7eb;
@@ -269,7 +263,6 @@ tr:hover td{background:rgba(96,165,250,.06)}
 .hint{color:var(--muted);font-size:12px;text-align:center;margin-top:10px}
 """
 
-# ----------- Templates (no Python f-strings; pure Jinja) -----------
 TPL_HOME = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -426,8 +419,7 @@ TPL_RECENT = """
 </body></html>
 """
 
-# ----------- Main -----------
+# ---------- Local run ----------
 if __name__ == "__main__":
-    init_db()
-    # Local dev (Render will run via gunicorn)
+    # For local dev; on Render, Gunicorn will import this file and the init_db already ran.
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
