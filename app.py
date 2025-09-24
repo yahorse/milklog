@@ -1,4 +1,11 @@
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, request as flask_request
+# app.py
+# Milk Log – mobile-friendly Flask app
+# - Enter Cow Number, Litres, Date
+# - Records view auto-creates a new column per date (same cow + same date sums)
+# - Export to Excel (raw + pivot)
+# - FIX: no Python max/min calls inside Jinja; links use precomputed values
+
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
@@ -22,7 +29,8 @@ def init_db():
         """)
 
 def add_record(cow_number: str, litres: float, record_date_str: str):
-    _ = date.fromisoformat(record_date_str)  # validate
+    # Validate date
+    _ = date.fromisoformat(record_date_str)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
           INSERT INTO milk_records (cow_number, litres, record_date, created_at)
@@ -49,7 +57,8 @@ def get_last_n_dates(n:int):
           LIMIT ?
         """, (n,))
         dates = [r["record_date"] for r in cur.fetchall()]
-        return list(reversed(dates))  # oldest -> newest for left-to-right header
+        # show oldest -> newest across columns
+        return list(reversed(dates))
 
 def build_pivot_for_dates(dates):
     """Return (dates, rows) where:
@@ -77,14 +86,14 @@ def build_pivot_for_dates(dates):
         by_cow.setdefault(cow, {})
         by_cow[cow][r["record_date"]] = float(r["litres"] or 0)
 
-    # Build rows aligned to dates
-    rows = []
     # numeric-ish sort of cows
     def cow_key(c):
         try:
             return (0, int(c))
         except:
             return (1, c)
+
+    rows = []
     for cow in sorted(by_cow.keys(), key=cow_key):
         cells = [round(by_cow[cow].get(d, 0.0), 2) for d in dates]
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
@@ -101,15 +110,23 @@ def new_record_screen():
 
 @app.route("/records")
 def records_screen():
-    # choose how many recent dates to show as columns (default 7)
+    # sanitize ?last=... from the query string (how many recent dates to show as columns)
     try:
-        last = int(flask_request.args.get("last", "7"))
-        last = max(1, min(last, 90))
+        last = int(request.args.get("last", "7"))
     except ValueError:
         last = 7
+    last = max(1, min(last, 90))
+
+    prev_last = max(1, last - 3)
+    next_last = min(90, last + 3)
+
     dates = get_last_n_dates(last)
     dates, rows = build_pivot_for_dates(dates)
-    return render_template_string(TPL_RECORDS, dates=dates, rows=rows, last=last)
+    return render_template_string(
+        TPL_RECORDS,
+        dates=dates, rows=rows, last=last,
+        prev_last=prev_last, next_last=next_last
+    )
 
 @app.route("/add", methods=["POST"])
 def add():
@@ -139,7 +156,7 @@ def export_excel():
     data = get_all_rows()
     wb = Workbook()
 
-    # Sheet 1: raw
+    # Sheet 1: Raw data
     ws = wb.active
     ws.title = "Raw Records"
     ws.append(["ID", "Cow Number", "Litres", "Record Date", "Saved (UTC)"])
@@ -148,7 +165,7 @@ def export_excel():
     for col, w in zip("ABCDE", [8,12,10,12,25]):
         ws.column_dimensions[col].width = w
 
-    # Sheet 2: latest 7-day pivot (like the UI)
+    # Sheet 2: Pivot (last 7 dates)
     dates = get_last_n_dates(7)
     dates, rows = build_pivot_for_dates(dates)
     ws2 = wb.create_sheet("Pivot (last 7 dates)")
@@ -257,8 +274,8 @@ TPL_RECORDS = f"""
       <a class="btn secondary" href="{{{{ url_for('home') }}}}">Back</a>
       <div class="title">Cow Records</div>
       <div style="display:flex;gap:8px;align-items:center">
-        <a class="btn secondary" href="{{{{ url_for('records_screen', last=max(1, last-3)) }}}}">-3d</a>
-        <a class="btn secondary" href="{{{{ url_for('records_screen', last=min(90, last+3)) }}}}">+3d</a>
+        <a class="btn secondary" href="{{{{ url_for('records_screen', last=prev_last) }}}}">-3d</a>
+        <a class="btn secondary" href="{{{{ url_for('records_screen', last=next_last) }}}}">+3d</a>
         <a class="btn" href="{{{{ url_for('export_excel') }}}}">Export</a>
       </div>
     </div>
