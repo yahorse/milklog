@@ -1,24 +1,37 @@
 # app.py
-# Milk Log – mobile-friendly Flask app with Delete support
+# Milk Log – mobile-friendly Flask app for Render
 # - Enter Cow Number, Litres, Date
-# - Records view auto-creates a new column per date (same cow + same date sums)
+# - Records view auto-creates a new column per date (same cow+date sums)
 # - Recent Entries list with per-row Delete (POST + confirm)
 # - Export to Excel (raw + pivot)
-# - FIX: correct Jinja braces in templates
+# - Render persistence: uses /var/data if mounted; WAL mode enabled
+# - Optional secure backup route /backup.db?token=...
 
-from flask import Flask, request, redirect, url_for, render_template_string, send_file
+import os
+import io
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
-import io
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
 from openpyxl import Workbook
 
 app = Flask(__name__)
-DB_PATH = "milk_records.db"
 
-# ------------- DB -------------
+# ----------- Persistence (Render) -----------
+DATA_DIR = os.getenv("DATA_DIR", "/var/data")
+if not os.path.isdir(DATA_DIR):
+    DATA_DIR = "."
+DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
+
+# Optional backup token (set in Render env to enable /backup.db)
+BACKUP_TOKEN = os.getenv("BACKUP_TOKEN")
+
+# ----------- DB helpers -----------
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        # Durability + concurrent reads
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("""
           CREATE TABLE IF NOT EXISTS milk_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +43,7 @@ def init_db():
         """)
 
 def add_record(cow_number: str, litres: float, record_date_str: str):
-    _ = date.fromisoformat(record_date_str)  # validate date
+    _ = date.fromisoformat(record_date_str)  # validate date format
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
           INSERT INTO milk_records (cow_number, litres, record_date, created_at)
@@ -72,12 +85,13 @@ def get_last_n_dates(n:int):
           LIMIT ?
         """, (n,))
         dates = [r["record_date"] for r in cur.fetchall()]
-        return list(reversed(dates))  # show oldest -> newest across columns
+        return list(reversed(dates))  # show oldest -> newest left-to-right
 
 def build_pivot_for_dates(dates):
-    """Return (dates, rows) where:
-       dates: ['YYYY-MM-DD', ...]
-       rows: [{'cow':'2146','cells':[12,17,...],'total':29}, ...]
+    """
+    Return (dates, rows) where:
+      dates: ['YYYY-MM-DD', ...]
+      rows: [{'cow':'2146','cells':[12,17,...],'total':29}, ...]
     """
     if not dates:
         return [], []
@@ -100,7 +114,7 @@ def build_pivot_for_dates(dates):
         by_cow.setdefault(cow, {})
         by_cow[cow][r["record_date"]] = float(r["litres"] or 0)
 
-    # numeric-ish sort of cows
+    # numeric-ish sort
     def cow_key(c):
         try:
             return (0, int(c))
@@ -113,18 +127,18 @@ def build_pivot_for_dates(dates):
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
     return dates, rows
 
-# ------------- Routes -------------
+# ----------- Routes -----------
 @app.route("/")
 def home():
-    return render_template_string(TPL_HOME)
+    return render_template_string(TPL_HOME, base_css=BASE_CSS)
 
 @app.route("/new")
 def new_record_screen():
-    return render_template_string(TPL_NEW, today=date.today().isoformat())
+    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=date.today().isoformat())
 
 @app.route("/records")
 def records_screen():
-    # sanitize ?last=... (how many recent dates to show as columns)
+    # how many recent dates to show as columns
     try:
         last = int(request.args.get("last", "7"))
     except ValueError:
@@ -138,6 +152,7 @@ def records_screen():
     dates, rows = build_pivot_for_dates(dates)
     return render_template_string(
         TPL_RECORDS,
+        base_css=BASE_CSS,
         dates=dates, rows=rows, last=last,
         prev_last=prev_last, next_last=next_last
     )
@@ -151,7 +166,7 @@ def recent_screen():
     limit = max(1, min(limit, 500))
     rows = get_recent_rows(limit)
     msg = "Deleted 1 entry." if request.args.get("deleted") == "1" else None
-    return render_template_string(TPL_RECENT, rows=rows, msg=msg, limit=limit)
+    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit)
 
 @app.route("/add", methods=["POST"])
 def add():
@@ -212,7 +227,20 @@ def export_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# ------------- HTML -------------
+@app.route("/backup.db")
+def backup_db():
+    # Enable only if BACKUP_TOKEN is set in env and provided as ?token=
+    if not BACKUP_TOKEN:
+        return "Not enabled", 404
+    if request.args.get("token") != BACKUP_TOKEN:
+        return "Forbidden", 403
+    return send_file(DB_PATH, as_attachment=True, download_name="milk_records.db")
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+# ----------- Styles (passed into templates) -----------
 BASE_CSS = """
 :root{
   --bg:#0b1220; --panel:#0f172a; --border:#1f2937; --text:#e5e7eb;
@@ -241,18 +269,19 @@ tr:hover td{background:rgba(96,165,250,.06)}
 .hint{color:var(--muted);font-size:12px;text-align:center;margin-top:10px}
 """
 
-TPL_HOME = f"""
+# ----------- Templates (no Python f-strings; pure Jinja) -----------
+TPL_HOME = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Milk Log</title><style>{BASE_CSS}</style></head><body>
+<title>Milk Log</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top"><div class="title">Milk Log</div></div>
     <div class="card">
       <div style="font-size:18px;font-weight:700;margin-bottom:8px">First app menu</div>
       <div class="menu">
-        <a class="btn" href="{{{{ url_for('records_screen') }}}}">Cow Records</a>
-        <a class="btn secondary" href="{{{{ url_for('new_record_screen') }}}}">New Recording</a>
-        <a class="btn secondary" href="{{{{ url_for('recent_screen') }}}}">Recent Entries</a>
+        <a class="btn" href="{{ url_for('records_screen') }}">Cow Records</a>
+        <a class="btn secondary" href="{{ url_for('new_record_screen') }}">New Recording</a>
+        <a class="btn secondary" href="{{ url_for('recent_screen') }}">Recent Entries</a>
       </div>
     </div>
     <div class="hint">Tip: Add this page to your phone’s home screen.</div>
@@ -260,18 +289,18 @@ TPL_HOME = f"""
 </body></html>
 """
 
-TPL_NEW = f"""
+TPL_NEW = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>New Recording</title><style>{BASE_CSS}</style></head><body>
+<title>New Recording</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
-      <a class="btn secondary" href="{{{{ url_for('home') }}}}">Back</a>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
       <div class="title">New Recording</div>
       <span></span>
     </div>
     <div class="card">
-      <form method="POST" action="{{{{ url_for('add') }}}}" autocomplete="off">
+      <form method="POST" action="{{ url_for('add') }}" autocomplete="off">
         <div class="grid2">
           <div class="field">
             <label for="cow_number">Cow Number</label>
@@ -284,11 +313,11 @@ TPL_NEW = f"""
         </div>
         <div class="field" style="margin-top:12px">
           <label for="record_date">Record date</label>
-          <input id="record_date" name="record_date" type="date" value="{{{{ today }}}}">
+          <input id="record_date" name="record_date" type="date" value="{{ today }}">
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
           <button class="btn" type="submit">Finish Recording</button>
-          <a class="btn secondary" href="{{{{ url_for('records_screen') }}}}">View Records</a>
+          <a class="btn secondary" href="{{ url_for('records_screen') }}">View Records</a>
         </div>
       </form>
     </div>
@@ -296,42 +325,44 @@ TPL_NEW = f"""
 </body></html>
 """
 
-TPL_RECORDS = f"""
+TPL_RECORDS = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cow Records</title><style>{BASE_CSS}</style></head><body>
+<title>Cow Records</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
-      <a class="btn secondary" href="{{{{ url_for('home') }}}}">Back</a>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
       <div class="title">Cow Records</div>
       <div style="display:flex;gap:8px;align-items:center">
-        <a class="btn secondary" href="{{{{ url_for('records_screen', last=prev_last) }}}}">-3d</a>
-        <a class="btn secondary" href="{{{{ url_for('records_screen', last=next_last) }}}}">+3d</a>
-        <a class="btn" href="{{{{ url_for('export_excel') }}}}">Export</a>
+        <a class="btn secondary" href="{{ url_for('records_screen', last=prev_last) }}">-3d</a>
+        <a class="btn secondary" href="{{ url_for('records_screen', last=next_last) }}">+3d</a>
+        <a class="btn" href="{{ url_for('export_excel') }}">Export</a>
       </div>
     </div>
     <div class="card">
-      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">Showing last {{{{ last }}}} date{{ '{{' }} '' if last==1 else 's' {{ '}}' }}.</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
+        Showing last {{ last }} date{{ '' if last==1 else 's' }}.
+      </div>
       <table aria-label="Records by cow">
         <thead>
           <tr>
             <th>Cow #</th>
-            {{% for d in dates %}}<th>{{{{ d }}}}</th>{{% endfor %}}
+            {% for d in dates %}<th>{{ d }}</th>{% endfor %}
             <th>Total</th>
           </tr>
         </thead>
         <tbody>
-          {{% if rows %}}
-            {{% for r in rows %}}
+          {% if rows %}
+            {% for r in rows %}
               <tr>
-                <td>{{{{ r.cow }}}}</td>
-                {{% for v in r.cells %}}<td>{{{{ '%.2f'|format(v) }}}}</td>{{% endfor %}}
-                <td>{{{{ '%.2f'|format(r.total) }}}}</td>
+                <td>{{ r.cow }}</td>
+                {% for v in r.cells %}<td>{{ '%.2f'|format(v) }}</td>{% endfor %}
+                <td>{{ '%.2f'|format(r.total) }}</td>
               </tr>
-            {{% endfor %}}
-          {{% else %}}
-            <tr><td colspan="{{{{ 2 + (dates|length) }}}}" style="color:var(--muted)">No records yet.</td></tr>
-          {{% endif %}}
+            {% endfor %}
+          {% else %}
+            <tr><td colspan="{{ 2 + (dates|length) }}" style="color:var(--muted)">No records yet.</td></tr>
+          {% endif %}
         </tbody>
       </table>
     </div>
@@ -339,24 +370,24 @@ TPL_RECORDS = f"""
 </body></html>
 """
 
-TPL_RECENT = f"""
+TPL_RECENT = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Recent Entries</title><style>{BASE_CSS}</style></head><body>
+<title>Recent Entries</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
-      <a class="btn secondary" href="{{{{ url_for('home') }}}}">Back</a>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
       <div class="title">Recent Entries</div>
       <span></span>
     </div>
 
-    {{% if msg %}}
-      <div class="card" style="border-color:#16a34a">✔ {{{{ msg }}}}</div>
-    {{% endif %}}
+    {% if msg %}
+      <div class="card" style="border-color:#16a34a">✔ {{ msg }}</div>
+    {% endif %}
 
     <div class="card">
       <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
-        Showing latest {{{{ rows|length }}}} (limit {{{{ limit }}}}).
+        Showing latest {{ rows|length }} (limit {{ limit }}).
       </div>
       <table aria-label="Recent raw records">
         <thead>
@@ -370,24 +401,24 @@ TPL_RECENT = f"""
           </tr>
         </thead>
         <tbody>
-          {{% if rows %}}
-            {{% for r in rows %}}
+          {% if rows %}
+            {% for r in rows %}
               <tr>
-                <td>{{{{ r['id'] }}}}</td>
-                <td>{{{{ r['cow_number'] }}}}</td>
-                <td>{{{{ '%.2f'|format(r['litres']) }}}}</td>
-                <td>{{{{ r['record_date'] }}}}</td>
-                <td>{{{{ r['created_at'] }}}}</td>
+                <td>{{ r['id'] }}</td>
+                <td>{{ r['cow_number'] }}</td>
+                <td>{{ '%.2f'|format(r['litres']) }}</td>
+                <td>{{ r['record_date'] }}</td>
+                <td>{{ r['created_at'] }}</td>
                 <td>
-                  <form method="POST" action="{{{{ url_for('delete', rec_id=r['id']) }}}}" onsubmit="return confirm('Delete this entry?')">
+                  <form method="POST" action="{{ url_for('delete', rec_id=r['id']) }}" onsubmit="return confirm('Delete this entry?')">
                     <button class="btn warn" type="submit">Delete</button>
                   </form>
                 </td>
               </tr>
-            {{% endfor %}}
-          {{% else %}}
+            {% endfor %}
+          {% else %}
             <tr><td colspan="6" style="color:var(--muted)">No entries yet.</td></tr>
-          {{% endif %}}
+          {% endif %}
         </tbody>
       </table>
     </div>
@@ -395,7 +426,8 @@ TPL_RECENT = f"""
 </body></html>
 """
 
-# ------------- Main -------------
+# ----------- Main -----------
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Local dev (Render will run via gunicorn)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
