@@ -270,7 +270,7 @@ TPL_HOME = """
   <div class="wrap">
     <div class="top"><div class="title">Milk Log</div></div>
     <div class="card">
-      <div style="font-size:18px;font-weight:700;margin-bottom:8px">First app menu</div>
+      <div style="font-size:18px;font-weight:700;margin-bottom:8px">Cow Milk Logger</div>
       <div class="menu">
         <a class="btn" href="{{ url_for('records_screen') }}">Cow Records</a>
         <a class="btn secondary" href="{{ url_for('new_record_screen') }}">New Recording</a>
