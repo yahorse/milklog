@@ -1,22 +1,22 @@
-{% extends "base.html" %}
-{% block content %}
-  <div class="top"><a class="btn secondary" href="{{ url_for('index') }}">Back</a><h1 class="title">Cow Records</h1></div>
-  <div class="card">
-    <a class="btn" href="{{ url_for('export_xlsx') }}">Export to Excel</a>
-    <table>
-      <thead>
-        <tr><th>ID</th><th>Cow #</th><th>Litres</th><th>Date</th><th>Created</th></tr>
-      </thead>
-      <tbody>
-        {% for r in rows %}
-          <tr>
-            <td>{{ r.id }}</td><td>{{ r.cow_number }}</td><td>{{ r.litres }}</td>
-            <td>{{ r.record_date }}</td><td>{{ r.created_at }}</td>
-          </tr>
-        {% else %}
-          <tr><td colspan="5" style="color:var(--muted);">No records yet.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-{% endblock %}
+# at top make sure you have:
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
+
+@app.route("/records")
+def records_screen():
+    # sanitize ?last=... from the query string
+    try:
+        last = int(request.args.get("last", "7"))
+    except ValueError:
+        last = 7
+    last = max(1, min(last, 90))
+
+    prev_last = max(1, last - 3)
+    next_last = min(90, last + 3)
+
+    dates = get_last_n_dates(last)
+    dates, rows = build_pivot_for_dates(dates)
+    return render_template_string(
+        TPL_RECORDS,
+        dates=dates, rows=rows, last=last,
+        prev_last=prev_last, next_last=next_last
+    )
