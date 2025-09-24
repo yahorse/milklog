@@ -4,7 +4,7 @@
 # - Records view auto-creates a new column per date (same cow + same date sums)
 # - Recent Entries list with per-row Delete (POST + confirm)
 # - Export to Excel (raw + pivot)
-# - FIX kept: no Python max/min in Jinja; links use precomputed values
+# - FIX: correct Jinja braces in templates
 
 from flask import Flask, request, redirect, url_for, render_template_string, send_file
 import sqlite3
@@ -178,7 +178,6 @@ def add():
 @app.route("/delete/<int:rec_id>", methods=["POST"])
 def delete(rec_id):
     delete_record(rec_id)
-    # Redirect back to recent list with a small success flag
     return redirect(url_for("recent_screen", deleted=1))
 
 @app.route("/export.xlsx")
@@ -312,7 +311,7 @@ TPL_RECORDS = f"""
       </div>
     </div>
     <div class="card">
-      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">Showing last {{ last }} date{{ '' if last==1 else 's' }}.</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">Showing last {{{{ last }}}} date{{ '{{' }} '' if last==1 else 's' {{ '}}' }}.</div>
       <table aria-label="Records by cow">
         <thead>
           <tr>
@@ -352,12 +351,12 @@ TPL_RECENT = f"""
     </div>
 
     {{% if msg %}}
-      <div class="card" style="border-color:#16a34a">✔ {{'{{'}} msg {{'}}'}}</div>
+      <div class="card" style="border-color:#16a34a">✔ {{{{ msg }}}}</div>
     {{% endif %}}
 
     <div class="card">
       <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
-        Showing latest {{'{{'}} rows|length {{'}}'}} (limit {{'{{'}} { '{' }{ '{' } limit { '}' }{ '}' } }}}}).
+        Showing latest {{{{ rows|length }}}} (limit {{{{ limit }}}}).
       </div>
       <table aria-label="Recent raw records">
         <thead>
@@ -374,13 +373,13 @@ TPL_RECENT = f"""
           {{% if rows %}}
             {{% for r in rows %}}
               <tr>
-                <td>{{'{{'}} r['id'] {{'}}'}}</td>
-                <td>{{'{{'}} r['cow_number'] {{'}}'}}</td>
-                <td>{{'{{'}} '%.2f'|format(r['litres']) {{'}}'}}</td>
-                <td>{{'{{'}} r['record_date'] {{'}}'}}</td>
-                <td>{{'{{'}} r['created_at'] {{'}}'}}</td>
+                <td>{{{{ r['id'] }}}}</td>
+                <td>{{{{ r['cow_number'] }}}}</td>
+                <td>{{{{ '%.2f'|format(r['litres']) }}}}</td>
+                <td>{{{{ r['record_date'] }}}}</td>
+                <td>{{{{ r['created_at'] }}}}</td>
                 <td>
-                  <form method="POST" action="{{'{{'}} url_for('delete', rec_id=r['id']) {{'}}'}}" onsubmit="return confirm('Delete this entry?')">
+                  <form method="POST" action="{{{{ url_for('delete', rec_id=r['id']) }}}}" onsubmit="return confirm('Delete this entry?')">
                     <button class="btn warn" type="submit">Delete</button>
                   </form>
                 </td>
