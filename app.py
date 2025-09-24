@@ -1,9 +1,10 @@
 # app.py
-# Milk Log – mobile-friendly Flask app
+# Milk Log – mobile-friendly Flask app with Delete support
 # - Enter Cow Number, Litres, Date
 # - Records view auto-creates a new column per date (same cow + same date sums)
+# - Recent Entries list with per-row Delete (POST + confirm)
 # - Export to Excel (raw + pivot)
-# - FIX: no Python max/min calls inside Jinja; links use precomputed values
+# - FIX kept: no Python max/min in Jinja; links use precomputed values
 
 from flask import Flask, request, redirect, url_for, render_template_string, send_file
 import sqlite3
@@ -29,13 +30,16 @@ def init_db():
         """)
 
 def add_record(cow_number: str, litres: float, record_date_str: str):
-    # Validate date
-    _ = date.fromisoformat(record_date_str)
+    _ = date.fromisoformat(record_date_str)  # validate date
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
           INSERT INTO milk_records (cow_number, litres, record_date, created_at)
           VALUES (?, ?, ?, ?)
         """, (cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()))
+
+def delete_record(rec_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute("DELETE FROM milk_records WHERE id = ?", (rec_id,))
 
 def get_all_rows():
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -45,6 +49,17 @@ def get_all_rows():
           FROM milk_records
           ORDER BY record_date ASC, cow_number ASC, id ASC
         """)
+        return cur.fetchall()
+
+def get_recent_rows(limit:int=100):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute("""
+          SELECT id, cow_number, litres, record_date, created_at
+          FROM milk_records
+          ORDER BY id DESC
+          LIMIT ?
+        """, (limit,))
         return cur.fetchall()
 
 def get_last_n_dates(n:int):
@@ -57,12 +72,11 @@ def get_last_n_dates(n:int):
           LIMIT ?
         """, (n,))
         dates = [r["record_date"] for r in cur.fetchall()]
-        # show oldest -> newest across columns
-        return list(reversed(dates))
+        return list(reversed(dates))  # show oldest -> newest across columns
 
 def build_pivot_for_dates(dates):
     """Return (dates, rows) where:
-       dates: ['2025-09-20','2025-09-21',...]
+       dates: ['YYYY-MM-DD', ...]
        rows: [{'cow':'2146','cells':[12,17,...],'total':29}, ...]
     """
     if not dates:
@@ -110,7 +124,7 @@ def new_record_screen():
 
 @app.route("/records")
 def records_screen():
-    # sanitize ?last=... from the query string (how many recent dates to show as columns)
+    # sanitize ?last=... (how many recent dates to show as columns)
     try:
         last = int(request.args.get("last", "7"))
     except ValueError:
@@ -127,6 +141,17 @@ def records_screen():
         dates=dates, rows=rows, last=last,
         prev_last=prev_last, next_last=next_last
     )
+
+@app.route("/recent")
+def recent_screen():
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    limit = max(1, min(limit, 500))
+    rows = get_recent_rows(limit)
+    msg = "Deleted 1 entry." if request.args.get("deleted") == "1" else None
+    return render_template_string(TPL_RECENT, rows=rows, msg=msg, limit=limit)
 
 @app.route("/add", methods=["POST"])
 def add():
@@ -148,8 +173,13 @@ def add():
     except Exception as e:
         return f"Bad date. Use YYYY-MM-DD. ({e})", 400
 
-    # go back to New screen for quick next entry
     return redirect(url_for("new_record_screen"))
+
+@app.route("/delete/<int:rec_id>", methods=["POST"])
+def delete(rec_id):
+    delete_record(rec_id)
+    # Redirect back to recent list with a small success flag
+    return redirect(url_for("recent_screen", deleted=1))
 
 @app.route("/export.xlsx")
 def export_excel():
@@ -198,6 +228,7 @@ body{margin:0;background:linear-gradient(180deg,#08101d,#0f172a);color:var(--tex
 .menu{display:grid;gap:12px}
 .btn{display:flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:#05220f;font-weight:800;padding:14px 16px;border:none;border-radius:14px;cursor:pointer;text-decoration:none;text-align:center}
 .btn.secondary{background:#0b1220;color:var(--text);border:1px solid var(--border)}
+.btn.warn{background:#ef4444;color:#fff}
 .field{display:grid;gap:6px}
 label{font-size:13px;color:var(--muted)}
 input{background:#0b1220;border:1px solid var(--border);color:var(--text);padding:14px 12px;border-radius:12px;font-size:16px;width:100%}
@@ -222,6 +253,7 @@ TPL_HOME = f"""
       <div class="menu">
         <a class="btn" href="{{{{ url_for('records_screen') }}}}">Cow Records</a>
         <a class="btn secondary" href="{{{{ url_for('new_record_screen') }}}}">New Recording</a>
+        <a class="btn secondary" href="{{{{ url_for('recent_screen') }}}}">Recent Entries</a>
       </div>
     </div>
     <div class="hint">Tip: Add this page to your phone’s home screen.</div>
@@ -300,6 +332,62 @@ TPL_RECORDS = f"""
             {{% endfor %}}
           {{% else %}}
             <tr><td colspan="{{{{ 2 + (dates|length) }}}}" style="color:var(--muted)">No records yet.</td></tr>
+          {{% endif %}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_RECENT = f"""
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recent Entries</title><style>{BASE_CSS}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <a class="btn secondary" href="{{{{ url_for('home') }}}}">Back</a>
+      <div class="title">Recent Entries</div>
+      <span></span>
+    </div>
+
+    {{% if msg %}}
+      <div class="card" style="border-color:#16a34a">✔ {{'{{'}} msg {{'}}'}}</div>
+    {{% endif %}}
+
+    <div class="card">
+      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
+        Showing latest {{'{{'}} rows|length {{'}}'}} (limit {{'{{'}} { '{' }{ '{' } limit { '}' }{ '}' } }}}}).
+      </div>
+      <table aria-label="Recent raw records">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Cow #</th>
+            <th>Litres</th>
+            <th>Date</th>
+            <th>Saved (UTC)</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{% if rows %}}
+            {{% for r in rows %}}
+              <tr>
+                <td>{{'{{'}} r['id'] {{'}}'}}</td>
+                <td>{{'{{'}} r['cow_number'] {{'}}'}}</td>
+                <td>{{'{{'}} '%.2f'|format(r['litres']) {{'}}'}}</td>
+                <td>{{'{{'}} r['record_date'] {{'}}'}}</td>
+                <td>{{'{{'}} r['created_at'] {{'}}'}}</td>
+                <td>
+                  <form method="POST" action="{{'{{'}} url_for('delete', rec_id=r['id']) {{'}}'}}" onsubmit="return confirm('Delete this entry?')">
+                    <button class="btn warn" type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            {{% endfor %}}
+          {{% else %}}
+            <tr><td colspan="6" style="color:var(--muted)">No entries yet.</td></tr>
           {{% endif %}}
         </tbody>
       </table>
