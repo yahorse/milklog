@@ -14,6 +14,7 @@ class MilkLogAppTests(unittest.TestCase):
         cls.admin_email = "admin@example.com"
         cls.admin_token = "mock-token-admin"
         cls.tenant_slug = "dairy-one"
+        os.environ["DEFAULT_GOOGLE_CLIENT_ID"] = "test-client-id"
         os.environ["TENANT_SETTINGS"] = json.dumps(
             [
                 {
@@ -108,6 +109,12 @@ class MilkLogAppTests(unittest.TestCase):
         new_token = "mock-new-token"
 
         create = self.client.post(
+            "/login",
+            data={
+                "tenant": new_slug,
+                "workspace_name": "Fresh Dairy",
+                "credential": new_token,
+                "email_hint": new_email,
             "/tenant/setup",
             data={
                 "name": "Fresh Dairy",
@@ -128,6 +135,7 @@ class MilkLogAppTests(unittest.TestCase):
             data={
                 "tenant": new_slug,
                 "credential": new_token,
+                "email_hint": new_email,
             },
             follow_redirects=True,
         )

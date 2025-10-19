@@ -587,6 +587,184 @@ def alerts_compute(owner_id):
     return missing, drops, holds
 
 # ---------- Auth routes ----------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    tenants = list_tenants()
+    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
+    default_client = (os.getenv("DEFAULT_GOOGLE_CLIENT_ID") or "").strip()
+
+    if request.method == "POST":
+        tenant_slug_input = (request.form.get("tenant") or "").strip()
+        tenant_slug = slugify(tenant_slug_input)
+        workspace_name = (request.form.get("workspace_name") or "").strip()
+        email_hint = (request.form.get("email_hint") or "").strip().lower()
+        credential = (request.form.get("credential") or "").strip()
+
+        if not tenant_slug:
+            flash("Workspace ID is required.", "error")
+            return (
+                render_template_string(
+                    TPL_LOGIN,
+                    base_css=BASE_CSS,
+                    tenants=tenants,
+                    tenant_clients_json=json.dumps(tenant_clients),
+                    default_client=default_client,
+                ),
+                400,
+            )
+
+        tenant = tenant_by_slug(tenant_slug)
+        created_now = False
+
+        if not tenant:
+            if not credential:
+                flash("Complete Google sign-in to create a workspace.", "error")
+                return (
+                    render_template_string(
+                        TPL_LOGIN,
+                        base_css=BASE_CSS,
+                        tenants=tenants,
+                        tenant_clients_json=json.dumps(tenant_clients),
+                        default_client=default_client,
+                    ),
+                    400,
+                )
+
+            if not default_client:
+                flash("DEFAULT_GOOGLE_CLIENT_ID must be configured to create workspaces.", "error")
+                return (
+                    render_template_string(
+                        TPL_LOGIN,
+                        base_css=BASE_CSS,
+                        tenants=tenants,
+                        tenant_clients_json=json.dumps(tenant_clients),
+                        default_client=default_client,
+                    ),
+                    400,
+                )
+
+            tenant_name = workspace_name or tenant_slug_input or tenant_slug.replace("-", " ").title()
+            temp_tenant = {
+                "id": None,
+                "slug": tenant_slug,
+                "name": tenant_name,
+                "google_client_id": default_client,
+                "allowed_domains": [],
+                "mock_users": [],
+            }
+            if email_hint:
+                temp_tenant["mock_users"].append({"email": email_hint, "credential": credential})
+
+            try:
+                verified_email, _ = verify_google_credential(
+                    credential,
+                    temp_tenant,
+                    email_hint=email_hint,
+                )
+            except ValueError as exc:
+                flash(str(exc), "error")
+                return (
+                    render_template_string(
+                        TPL_LOGIN,
+                        base_css=BASE_CSS,
+                        tenants=tenants,
+                        tenant_clients_json=json.dumps(tenant_clients),
+                        default_client=default_client,
+                    ),
+                    400,
+                )
+
+            exec_write(
+                """
+                INSERT INTO tenants (slug, name, google_client_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tenant_slug, tenant_name, default_client, datetime.utcnow().isoformat()),
+            )
+            tenant = tenant_by_slug(tenant_slug)
+            created_now = True
+            if tenant and email_hint:
+                exec_write(
+                    """
+                    INSERT OR REPLACE INTO tenant_mock_users (tenant_id, email, credential, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        tenant["id"],
+                        verified_email,
+                        credential,
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+        else:
+            try:
+                verified_email, _ = verify_google_credential(
+                    credential,
+                    tenant,
+                    email_hint=email_hint,
+                )
+            except ValueError as exc:
+                flash(str(exc), "error")
+                return (
+                    render_template_string(
+                        TPL_LOGIN,
+                        base_css=BASE_CSS,
+                        tenants=tenants,
+                        tenant_clients_json=json.dumps(tenant_clients),
+                        default_client=default_client,
+                    ),
+                    400,
+                )
+
+        user_row = query_one(
+            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+            (verified_email, tenant["id"]),
+        )
+        if not user_row:
+            role_row = query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
+                (tenant["id"],),
+            )
+            role = "admin" if (role_row["c"] == 0) else "user"
+            exec_write(
+                """
+                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    verified_email,
+                    "google-oauth",
+                    role,
+                    datetime.utcnow().isoformat(),
+                    tenant["id"],
+                ),
+            )
+            user_row = query_one(
+                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+                (verified_email, tenant["id"]),
+            )
+            if created_now:
+                flash(
+                    f"Workspace '{tenant['name']}' created. You're signed in as admin.",
+                    "ok",
+                )
+            else:
+                flash(
+                    f"Welcome to {tenant['name']}! Account created via Google sign-in.",
+                    "ok",
+                )
+
+        login_user(User(user_row))
+        return redirect(url_for("home"))
+
+    return render_template_string(
+        TPL_LOGIN,
+        base_css=BASE_CSS,
+        tenants=tenants,
+        tenant_clients_json=json.dumps(tenant_clients),
+        default_client=default_client,
+    )
+
 @app.route("/tenant/setup", methods=["GET", "POST"])
 def tenant_setup():
     default_client = (os.getenv("DEFAULT_GOOGLE_CLIENT_ID") or "").strip()
@@ -1656,6 +1834,23 @@ TPL_LOGIN = """
           <div class="title">Milk Log</div>
         </div>
       </div>
+      <p class="muted" style="margin-bottom:10px">Sign in with Google. Enter a new workspace ID to create one.</p>
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+      <form method="POST" class="login-form">
+        <div class="field"><label>Workspace ID</label>
+          <input name="tenant" list="tenant-options" placeholder="e.g. dairy-one" required>
+          <datalist id="tenant-options">
+            {% for tenant in tenants %}
+            <option value="{{ tenant.slug }}">{{ tenant.name }}</option>
+            {% endfor %}
+          </datalist>
+        </div>
+        <div class="field"><label>Workspace name (for new workspaces)</label><input name="workspace_name" placeholder="Fresh Dairy"></div>
+        <input type="hidden" name="credential" value="">
+        <input type="hidden" name="email_hint" value="">
+        <div class="full hint">Use the Google button below to continue.</div>
+      </form>
+      <div id="google-buttons" style="margin-top:16px"></div>
       <p class="muted" style="margin-bottom:10px">Choose your tenant and sign in with Google.</p>
       {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
       <form method="POST" class="login-form">
@@ -1691,6 +1886,34 @@ TPL_LOGIN = """
   <script>
     const tenantClients = {{ tenant_clients_json|safe }};
     const form = document.querySelector('form.login-form');
+    const tenantInput = form.querySelector('input[name="tenant"]');
+    const credentialInput = form.querySelector('input[name="credential"]');
+    const emailHintInput = form.querySelector('input[name="email_hint"]');
+    const defaultClient = {{ (default_client or "null")|tojson }};
+    const buttonRegion = document.getElementById('google-buttons');
+
+    function extractEmail(token) {
+      if (!token) return '';
+      const parts = token.split('.');
+      if (parts.length < 2) return '';
+      try {
+        const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+        const padded = payload + '='.repeat((4 - payload.length % 4) % 4);
+        const decoded = atob(padded);
+        const data = JSON.parse(decoded);
+        return (data.email || '').toLowerCase();
+      } catch (err) {
+        return '';
+      }
+    }
+
+    function resolveClientId(slug) {
+      return tenantClients[slug] || defaultClient || '';
+    }
+
+    function renderGoogleButton() {
+      buttonRegion.innerHTML = '';
+      const clientId = resolveClientId(tenantInput.value.trim());
     const tenantSelect = form.querySelector('select[name="tenant"]');
     const credentialInput = form.querySelector('input[name="credential"]');
     const mockInput = form.querySelector('input[name="mock_credential"]');
@@ -1712,6 +1935,10 @@ TPL_LOGIN = """
         client_id: clientId,
         callback: (response) => {
           credentialInput.value = response.credential;
+          const email = extractEmail(response.credential);
+          if (email) {
+            emailHintInput.value = email;
+          }
           mockInput.value = '';
           form.submit();
         },
@@ -1723,6 +1950,10 @@ TPL_LOGIN = """
 
     window.addEventListener('load', () => {
       renderGoogleButton();
+      tenantInput.addEventListener('input', () => {
+        emailHintInput.value = '';
+        renderGoogleButton();
+      });
       tenantSelect.addEventListener('change', renderGoogleButton);
     });
   </script>
