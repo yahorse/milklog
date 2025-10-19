@@ -35,6 +35,8 @@ class MilkLogAppTests(unittest.TestCase):
                 data={
                     "tenant": cls.tenant_slug,
                     "credential": cls.admin_token,
+                    "email": cls.admin_email,
+                    "mock_credential": cls.admin_token,
                 },
                 follow_redirects=True,
             )
@@ -61,6 +63,8 @@ class MilkLogAppTests(unittest.TestCase):
             data={
                 "tenant": self.tenant_slug,
                 "credential": self.admin_token,
+                "email": self.admin_email,
+                "mock_credential": self.admin_token,
             },
             follow_redirects=True,
         )

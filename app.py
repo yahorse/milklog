@@ -209,6 +209,7 @@ def list_tenants():
                 "google_client_id": row["google_client_id"],
                 "allowed_domains": cfg.get("allowed_domains", []),
                 "mock_users": mock_users,
+                "mock_users": cfg.get("mock_users", []),
             }
         )
     return tenants
@@ -228,6 +229,7 @@ def tenant_by_slug(slug):
         "google_client_id": row["google_client_id"],
         "allowed_domains": cfg.get("allowed_domains", []),
         "mock_users": mock_users,
+        "mock_users": cfg.get("mock_users", []),
     }
 
 
@@ -755,6 +757,77 @@ def login():
         tenant_slug = (request.form.get("tenant") or "").strip()
         email_hint = (request.form.get("email") or "").strip().lower()
         credential = request.form.get("credential")
+        tenant = tenant_by_slug(tenant_slug)
+        if not tenant:
+            flash("Unknown tenant selected.", "error")
+            return render_template_string(
+                TPL_LOGIN,
+                base_css=BASE_CSS,
+                tenants=tenants,
+                tenant_clients_json=json.dumps(tenant_clients),
+            )
+
+        try:
+            verified_email, _ = verify_google_credential(credential, tenant, email_hint=email_hint)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return render_template_string(
+                TPL_LOGIN,
+                base_css=BASE_CSS,
+                tenants=tenants,
+                tenant_clients_json=json.dumps(tenant_clients),
+            )
+
+        email = verified_email
+        user_row = query_one(
+            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+            (email, tenant["id"]),
+        )
+        if not user_row:
+            role_row = query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
+                (tenant["id"],),
+            )
+            role = "admin" if (role_row["c"] == 0) else "user"
+            exec_write(
+                """
+                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    "google-oauth",
+                    role,
+                    datetime.utcnow().isoformat(),
+                    tenant["id"],
+                ),
+            )
+            user_row = query_one(
+                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+                (email, tenant["id"]),
+            )
+            flash(f"Welcome to {tenant['name']}! Account created via Google sign-in.", "ok")
+
+        login_user(User(user_row))
+        return redirect(url_for("home"))
+
+    return render_template_string(
+        TPL_LOGIN,
+        base_css=BASE_CSS,
+        tenants=tenants,
+        tenant_clients_json=json.dumps(tenant_clients),
+    )
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    tenants = list_tenants()
+    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
+
+    if request.method == "POST":
+        tenant_slug = (request.form.get("tenant") or "").strip()
+        email_hint = (request.form.get("email") or "").strip().lower()
+        credential = request.form.get("credential")
+        credential = request.form.get("credential") or request.form.get("mock_credential")
         tenant = tenant_by_slug(tenant_slug)
         if not tenant:
             flash("Unknown tenant selected.", "error")
@@ -1586,6 +1659,9 @@ TPL_LOGIN = """
       <p class="muted" style="margin-bottom:10px">Choose your tenant and sign in with Google.</p>
       {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
       <form method="POST" class="login-form">
+      <p class="muted" style="margin-bottom:10px">Sign in with your Google account for the correct tenant workspace.</p>
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+      <form method="POST" class="grid2 login-form">
         <div class="field"><label>Tenant</label>
           <select name="tenant" required>
             {% for tenant in tenants %}
@@ -1598,6 +1674,17 @@ TPL_LOGIN = """
       </form>
       <div id="google-buttons" style="margin-top:16px"></div>
       <div class="hint" style="margin-top:18px">Setting up a new workspace? <a class="link" href="{{ url_for('tenant_setup') }}">Create it with Google</a>.</div>
+        <div class="field"><label>Email</label><input name="email" type="email" placeholder="you@company.com" required></div>
+        <input type="hidden" name="credential" value="">
+        <div class="field full">
+          <label>Google credential (paste ID token or mock credential)</label>
+          <input name="mock_credential" type="text" placeholder="Paste Google credential if button unavailable">
+        </div>
+        <div class="full"><button class="btn" type="submit">Continue with Google</button></div>
+      </form>
+      <div class="hint">Use the mock credential field when running in offline or testing environments.</div>
+      <div class="hint">When Google One Tap is available, use the button below for a seamless sign in.</div>
+      <div id="google-buttons" style="margin-top:16px"></div>
     </div>
   </div>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -1606,6 +1693,7 @@ TPL_LOGIN = """
     const form = document.querySelector('form.login-form');
     const tenantSelect = form.querySelector('select[name="tenant"]');
     const credentialInput = form.querySelector('input[name="credential"]');
+    const mockInput = form.querySelector('input[name="mock_credential"]');
     const buttonRegion = document.getElementById('google-buttons');
 
     function renderGoogleButton() {
@@ -1617,12 +1705,14 @@ TPL_LOGIN = """
       }
       if (!window.google || !google.accounts || !google.accounts.id) {
         buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in…</div>';
+      if (!clientId || !window.google || !google.accounts || !google.accounts.id) {
         return;
       }
       google.accounts.id.initialize({
         client_id: clientId,
         callback: (response) => {
           credentialInput.value = response.credential;
+          mockInput.value = '';
           form.submit();
         },
       });
