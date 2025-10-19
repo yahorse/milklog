@@ -31,7 +31,8 @@ def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("""
+        conn.execute(
+            """
           CREATE TABLE IF NOT EXISTS milk_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cow_number TEXT NOT NULL,
@@ -39,55 +40,73 @@ def init_db():
             record_date TEXT NOT NULL,        -- YYYY-MM-DD
             created_at TEXT NOT NULL          -- ISO (UTC)
           )
-        """)
+        """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON milk_records(record_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cow  ON milk_records(cow_number)")
+
 
 def add_record(cow_number: str, litres: float, record_date_str: str):
     # Validate date format
     _ = date.fromisoformat(record_date_str)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute("""
+        conn.execute(
+            """
           INSERT INTO milk_records (cow_number, litres, record_date, created_at)
           VALUES (?, ?, ?, ?)
-        """, (cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()))
+        """,
+            (cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()),
+        )
+
 
 def delete_record(rec_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("DELETE FROM milk_records WHERE id = ?", (rec_id,))
 
+
 def get_all_rows():
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        cur = conn.execute("""
+        cur = conn.execute(
+            """
           SELECT id, cow_number, litres, record_date, created_at
           FROM milk_records
           ORDER BY record_date ASC, cow_number ASC, id ASC
-        """)
+        """
+        )
         return cur.fetchall()
 
-def get_recent_rows(limit:int=100):
+
+def get_recent_rows(limit: int = 100):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        cur = conn.execute("""
+        cur = conn.execute(
+            """
           SELECT id, cow_number, litres, record_date, created_at
           FROM milk_records
           ORDER BY id DESC
           LIMIT ?
-        """, (limit,))
+        """,
+            (limit,),
+        )
         return cur.fetchall()
 
-def get_last_n_dates(n:int):
+
+def get_last_n_dates(n: int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        cur = conn.execute("""
+        cur = conn.execute(
+            """
           SELECT DISTINCT record_date
           FROM milk_records
           ORDER BY record_date DESC
           LIMIT ?
-        """, (n,))
+        """,
+            (n,),
+        )
         dates = [r["record_date"] for r in cur.fetchall()]
         return list(reversed(dates))  # show oldest -> newest across columns
+
 
 def build_pivot_for_dates(dates):
     """
@@ -101,12 +120,15 @@ def build_pivot_for_dates(dates):
     placeholders = ",".join("?" for _ in dates)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        cur = conn.execute(f"""
+        cur = conn.execute(
+            f"""
           SELECT cow_number, record_date, SUM(litres) AS litres
           FROM milk_records
           WHERE record_date IN ({placeholders})
           GROUP BY cow_number, record_date
-        """, tuple(dates))
+        """,
+            tuple(dates),
+        )
         data = cur.fetchall()
 
     # cow -> {date: litres}
@@ -129,6 +151,7 @@ def build_pivot_for_dates(dates):
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
     return dates, rows
 
+
 # Ensure DB exists instantly on import (important on Render/Gunicorn)
 init_db()
 
@@ -137,9 +160,11 @@ init_db()
 def home():
     return render_template_string(TPL_HOME, base_css=BASE_CSS)
 
+
 @app.route("/new")
 def new_record_screen():
     return render_template_string(TPL_NEW, base_css=BASE_CSS, today=date.today().isoformat())
+
 
 @app.route("/records")
 def records_screen():
@@ -157,9 +182,13 @@ def records_screen():
     return render_template_string(
         TPL_RECORDS,
         base_css=BASE_CSS,
-        dates=dates, rows=rows, last=last,
-        prev_last=prev_last, next_last=next_last
+        dates=dates,
+        rows=rows,
+        last=last,
+        prev_last=prev_last,
+        next_last=next_last,
     )
+
 
 @app.route("/recent")
 def recent_screen():
@@ -170,7 +199,10 @@ def recent_screen():
     limit = max(1, min(limit, 500))
     rows = get_recent_rows(limit)
     msg = "Deleted 1 entry." if request.args.get("deleted") == "1" else None
-    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit)
+    return render_template_string(
+        TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit
+    )
+
 
 @app.route("/add", methods=["POST"])
 def add():
@@ -194,15 +226,18 @@ def add():
 
     return redirect(url_for("new_record_screen"))
 
+
 @app.route("/delete/<int:rec_id>", methods=["POST"])
 def delete(rec_id):
     delete_record(rec_id)
     return redirect(url_for("recent_screen", deleted=1))
 
+
 @app.route("/export.xlsx")
 def export_excel():
     data = get_all_rows()
     from openpyxl import Workbook  # lazy import for speed
+
     wb = Workbook()
 
     # Sheet 1: Raw data
@@ -210,8 +245,10 @@ def export_excel():
     ws.title = "Raw Records"
     ws.append(["ID", "Cow Number", "Litres", "Record Date", "Saved (UTC)"])
     for r in data:
-        ws.append([r["id"], r["cow_number"], r["litres"], r["record_date"], r["created_at"]])
-    for col, w in zip("ABCDE", [8,12,10,12,25]):
+        ws.append(
+            [r["id"], r["cow_number"], r["litres"], r["record_date"], r["created_at"]]
+        )
+    for col, w in zip("ABCDE", [8, 12, 10, 12, 25]):
         ws.column_dimensions[col].width = w
 
     # Sheet 2: Pivot (last 7 dates)
@@ -232,9 +269,11 @@ def export_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+
 @app.route("/healthz")
 def healthz():
     return "ok", 200
+
 
 # ----------- Styles & Templates -----------
 BASE_CSS = """
@@ -269,10 +308,10 @@ thead, tbody { display: table; width: 100%; }
 th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 th{color:var(--muted);font-weight:600;background:#0b1220;position:sticky;top:0}
 tr:hover td{background:rgba(120,190,255,.06)}
-.hint{color:var(--muted);font-size:12px;text-align:center;margin-top:12px}
-.badge{display:inline-block;background:#0b1220;border:1px solid var(--border);color:var(--text);
+hint{color:var(--muted);font-size:12px;text-align:center;margin-top:12px}
+badge{display:inline-block;background:#0b1220;border:1px solid var(--border);color:var(--text);
        border-radius:12px;padding:4px 10px;font-size:12px}
-.subtle{color:var(--muted);font-size:12px;text-align:center;margin-top:14px}
+subtle{color:var(--muted);font-size:12px;text-align:center;margin-top:14px}
 .header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .hero{display:grid;grid-template-columns:1fr;gap:16px;margin-bottom:14px}
 .hero .stat{background:#0b1220;border:1px dashed #1b2a3e;border-radius:12px;padding:10px 12px;color:var(--muted);font-size:12px}
