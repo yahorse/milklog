@@ -459,6 +459,21 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
+const CACHE = "milklog-v6";
+const STATIC_ASSETS = ["/manifest.json"];
+
+self.addEventListener("install", event => {
+  event.waitUntil(
+    caches.open(CACHE).then(cache => cache.addAll(STATIC_ASSETS))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", event => {
+  event.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))
+    )
 const CACHE = "milklog-v5";
 const ASSETS = [
   "/","/new","/records","/recent","/cows","/health","/breeding",
@@ -478,6 +493,65 @@ self.addEventListener("fetch", e => {
       })
       .catch(() => caches.match(e.request))
   );
+  self.clients.claim();
+});
+
+const isHtmlRequest = request =>
+  request.mode === "navigate" ||
+  (request.headers.get("accept") || "").includes("text/html");
+
+async function networkFirst(event) {
+  try {
+    const fresh = await fetch(event.request);
+    if (fresh && fresh.ok) {
+      const cache = await caches.open(CACHE);
+      cache.put(event.request, fresh.clone());
+    }
+    return fresh;
+  } catch (error) {
+    const cached = await caches.match(event.request);
+    if (cached) {
+      return cached;
+    }
+    return new Response("Offline", { status: 503, headers: { "Content-Type": "text/plain" } });
+  }
+}
+
+async function staleWhileRevalidate(event) {
+  const cached = await caches.match(event.request);
+  if (cached) {
+    event.waitUntil(
+      fetch(event.request)
+        .then(response => {
+          if (response && response.ok) {
+            return caches.open(CACHE).then(cache => cache.put(event.request, response.clone()));
+          }
+          return undefined;
+        })
+        .catch(() => undefined)
+    );
+    return cached;
+  }
+
+  const fresh = await fetch(event.request);
+  if (fresh && fresh.ok) {
+    const cache = await caches.open(CACHE);
+    cache.put(event.request, fresh.clone());
+  }
+  return fresh;
+}
+
+self.addEventListener("fetch", event => {
+  if (event.request.method !== "GET" || !event.request.url.startsWith(self.location.origin)) {
+    return;
+  }
+
+  if (isHtmlRequest(event.request)) {
+    event.respondWith(networkFirst(event));
+    return;
+  }
+
+  event.respondWith(staleWhileRevalidate(event));
 });
 """
     return Response(js, mimetype="application/javascript")
