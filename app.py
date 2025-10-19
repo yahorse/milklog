@@ -459,16 +459,24 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-const CACHE = "milklog-v4";
-const ASSETS = ["/","/new","/records","/recent","/cows","/health","/breeding","/bulk","/alerts","/import","/export.csv","/manifest.json","/login","/register"];
+const CACHE = "milklog-v5";
+const ASSETS = [
+  "/","/new","/records","/recent","/cows","/health","/breeding",
+  "/bulk","/alerts","/import","/export.csv","/manifest.json","/login","/register"
+];
 self.addEventListener("install", e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS))));
 self.addEventListener("fetch", e => {
+  if (e.request.method !== "GET") {
+    return;
+  }
   e.respondWith(
-    caches.match(e.request).then(res => res || fetch(e.request).then(r => {
-      const copy = r.clone();
-      caches.open(CACHE).then(c => c.put(e.request, copy)).catch(()=>{});
-      return r;
-    }))
+    fetch(e.request)
+      .then(r => {
+        const copy = r.clone();
+        caches.open(CACHE).then(c => c.put(e.request, copy)).catch(()=>{});
+        return r;
+      })
+      .catch(() => caches.match(e.request))
   );
 });
 """
