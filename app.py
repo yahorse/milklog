@@ -1,14 +1,17 @@
 # app.py
-# Milk Log – Flask app with Google Login (Authlib) and per-user data
-# - Google OAuth login/logout
-# - Each record is owned by the logged-in Google account (sub)
-# - Render-ready (persistent SQLite, WAL), delete, pivot, export, backup
+# Milk Log – Flask app with Google Login, per-user data, and schema migration
+# - Google OAuth (Authlib), per-user isolation via owner_sub
+# - Migration-safe DB init (adds owner_sub if missing, creates indexes)
+# - Claim legacy rows (NULL owner_sub) for first logged-in user
+# - Render-ready: persistent SQLite on /var/data, WAL mode
+# - Features: add, pivot-by-date, recent+delete, export.xlsx, optional backup, healthz
 
 import os
 import io
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
+from functools import wraps
 
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
@@ -16,12 +19,12 @@ from flask import (
 )
 from openpyxl import Workbook
 from authlib.integrations.flask_client import OAuth
-from functools import wraps
 
 app = Flask(__name__)
 
 # ---------- Config & Persistence ----------
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-please-change")
+
 DATA_DIR = os.getenv("DATA_DIR", "/var/data")
 if not os.path.isdir(DATA_DIR):
     DATA_DIR = "."
@@ -32,6 +35,7 @@ DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
+BACKUP_TOKEN = os.getenv("BACKUP_TOKEN")
 
 # ---------- OAuth (Google) ----------
 oauth = OAuth(app)
@@ -41,9 +45,7 @@ if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
         server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-        client_kwargs={
-            "scope": "openid email profile"
-        },
+        client_kwargs={"scope": "openid email profile"},
     )
 
 def login_required(f):
@@ -55,28 +57,36 @@ def login_required(f):
     return wrapper
 
 def current_owner_sub() -> str:
-    # unique Google account identifier
     u = session.get("user")
     return u["sub"] if u else None
 
 # ---------- DB helpers ----------
 def init_db():
+    """Create/upgrade schema safely (handles legacy DB without owner_sub)."""
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        # Main table + owner_sub for per-user isolation
+
+        # Ensure table exists (owner_sub nullable so we can migrate legacy rows)
         conn.execute("""
           CREATE TABLE IF NOT EXISTS milk_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_sub TEXT NOT NULL,
+            owner_sub TEXT,
             cow_number TEXT NOT NULL,
             litres REAL NOT NULL CHECK(litres >= 0),
-            record_date TEXT NOT NULL,        -- YYYY-MM-DD
-            created_at TEXT NOT NULL          -- ISO (UTC)
+            record_date TEXT NOT NULL,       -- YYYY-MM-DD
+            created_at TEXT NOT NULL         -- ISO (UTC)
           )
         """)
+
+        # MIGRATION: add owner_sub column if missing on very old DBs
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(milk_records)").fetchall()]
+        if "owner_sub" not in cols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN owner_sub TEXT")
+
+        # Indexes (safe to create repeatedly)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_date ON milk_records(owner_sub, record_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_cow ON milk_records(owner_sub, cow_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_cow  ON milk_records(owner_sub, cow_number)")
 
 def add_record(owner_sub: str, cow_number: str, litres: float, record_date_str: str):
     _ = date.fromisoformat(record_date_str)
@@ -125,7 +135,7 @@ def get_last_n_dates(owner_sub: str, n:int):
           LIMIT ?
         """, (owner_sub, n))
         dates = [r["record_date"] for r in cur.fetchall()]
-        return list(reversed(dates))
+        return list(reversed(dates))  # oldest -> newest across columns
 
 def build_pivot_for_dates(owner_sub: str, dates):
     if not dates:
@@ -133,6 +143,7 @@ def build_pivot_for_dates(owner_sub: str, dates):
     placeholders = ",".join("?" for _ in dates)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
+        # owner_sub plus date placeholders
         cur = conn.execute(f"""
           SELECT cow_number, record_date, SUM(litres) AS litres
           FROM milk_records
@@ -158,7 +169,12 @@ def build_pivot_for_dates(owner_sub: str, dates):
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
     return dates, rows
 
-# Make sure DB exists (important for Gunicorn on Render)
+def claim_legacy_rows_for(owner_sub: str):
+    """Assign any legacy rows (NULL owner_sub) to this user once."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute("UPDATE milk_records SET owner_sub = ? WHERE owner_sub IS NULL", (owner_sub,))
+
+# Ensure DB exists / migrated at import time (important for Gunicorn/Render)
 init_db()
 
 # ---------- Auth routes ----------
@@ -166,8 +182,7 @@ init_db()
 def login():
     if "google" not in oauth._clients:
         return "Google OAuth not configured.", 500
-    next_url = request.args.get("next") or url_for("home")
-    session["post_login_redirect"] = next_url
+    session["post_login_redirect"] = request.args.get("next") or url_for("home")
     return oauth.google.authorize_redirect(redirect_uri=OAUTH_REDIRECT_URI)
 
 @app.route("/auth/callback")
@@ -175,19 +190,29 @@ def auth_callback():
     if "google" not in oauth._clients:
         return "Google OAuth not configured.", 500
     token = oauth.google.authorize_access_token()
-    userinfo = token.get("userinfo")
-    if not userinfo:
-        # Some providers return userinfo via separate endpoint:
-        userinfo = oauth.google.parse_id_token(token)
+    userinfo = token.get("userinfo") or oauth.google.parse_id_token(token)
     if not userinfo or "sub" not in userinfo:
         return "Login failed.", 400
-    # Store only what's needed
+
     session["user"] = {
         "sub": userinfo["sub"],
         "email": userinfo.get("email"),
         "name": userinfo.get("name"),
         "picture": userinfo.get("picture"),
     }
+
+    # OPTIONAL: restrict to a domain
+    # email = session["user"].get("email", "")
+    # if not email.endswith("@yourfarm.ie"):
+    #     session.clear()
+    #     return "Unauthorized domain", 403
+
+    # Claim legacy rows so the user can see pre-existing data
+    try:
+        claim_legacy_rows_for(session["user"]["sub"])
+    except Exception:
+        pass
+
     return redirect(session.pop("post_login_redirect", url_for("home")))
 
 @app.route("/logout")
@@ -305,14 +330,12 @@ def export_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# Optional protected backup (per-user DB not needed; this backs up whole DB)
 @app.route("/backup.db")
 @login_required
 def backup_db():
-    token = os.getenv("BACKUP_TOKEN")
-    if not token:
+    if not BACKUP_TOKEN:
         return "Not enabled", 404
-    if request.args.get("token") != token:
+    if request.args.get("token") != BACKUP_TOKEN:
         return "Forbidden", 403
     return send_file(DB_PATH, as_attachment=True, download_name="milk_records.db")
 
@@ -351,7 +374,6 @@ tr:hover td{background:rgba(96,165,250,.06)}
 .userbar img{width:28px;height:28px;border-radius:50%}
 """
 
-# Note: we pass `user` into templates; show login/logout + who’s logged in.
 TPL_HOME = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
