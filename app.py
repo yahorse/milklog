@@ -922,6 +922,197 @@ def tenant_setup():
         form_values=form_values,
         default_client=default_client,
     )
+
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    tenants = list_tenants()
+    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
+
+    if request.method == "POST":
+        tenant_slug = (request.form.get("tenant") or "").strip()
+        email_hint = (request.form.get("email") or "").strip().lower()
+        credential = request.form.get("credential")
+        tenant = tenant_by_slug(tenant_slug)
+        if not tenant:
+            flash("Unknown tenant selected.", "error")
+            return render_template_string(
+                TPL_LOGIN,
+                base_css=BASE_CSS,
+                tenants=tenants,
+                tenant_clients_json=json.dumps(tenant_clients),
+            )
+
+        try:
+            verified_email, _ = verify_google_credential(credential, tenant, email_hint=email_hint)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return render_template_string(
+                TPL_LOGIN,
+                base_css=BASE_CSS,
+                tenants=tenants,
+                tenant_clients_json=json.dumps(tenant_clients),
+            )
+
+        email = verified_email
+        user_row = query_one(
+            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+            (email, tenant["id"]),
+        )
+        if not user_row:
+            role_row = query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
+                (tenant["id"],),
+            )
+            role = "admin" if (role_row["c"] == 0) else "user"
+            exec_write(
+                """
+                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    "google-oauth",
+                    role,
+                    datetime.utcnow().isoformat(),
+                    tenant["id"],
+                ),
+            )
+            user_row = query_one(
+                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+                (email, tenant["id"]),
+            )
+            flash(f"Welcome to {tenant['name']}! Account created via Google sign-in.", "ok")
+
+        login_user(User(user_row))
+        return redirect(url_for("home"))
+
+    return render_template_string(
+        TPL_LOGIN,
+        base_css=BASE_CSS,
+        tenants=tenants,
+        tenant_clients_json=json.dumps(tenant_clients),
+    )
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    tenants = list_tenants()
+    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
+    default_client = (os.getenv("DEFAULT_GOOGLE_CLIENT_ID") or "").strip()
+
+    if request.method == "POST":
+        tenant_slug_raw = (request.form.get("tenant") or "").strip()
+        tenant_slug = slugify(tenant_slug_raw)
+        email_hint = (
+            (request.form.get("email_hint") or request.form.get("email") or "")
+            .strip()
+            .lower()
+        )
+        credential = (
+            (request.form.get("credential") or "")
+            or (request.form.get("mock_credential") or "")
+        ).strip()
+
+        if not tenant_slug:
+            flash("Workspace ID is required.", "error")
+            return (
+                render_template_string(
+                    TPL_LOGIN,
+                    base_css=BASE_CSS,
+                    tenants=tenants,
+                    tenant_clients_json=json.dumps(tenant_clients),
+                    default_client=default_client,
+                ),
+                400,
+            )
+
+        tenant = tenant_by_slug(tenant_slug)
+        if not tenant:
+            flash("Unknown workspace. Check the ID or create a new one.", "error")
+            return (
+                render_template_string(
+                    TPL_LOGIN,
+                    base_css=BASE_CSS,
+                    tenants=tenants,
+                    tenant_clients_json=json.dumps(tenant_clients),
+                    default_client=default_client,
+                ),
+                400,
+            )
+
+        if not credential:
+            flash("Complete Google sign-in to continue.", "error")
+            return (
+                render_template_string(
+                    TPL_LOGIN,
+                    base_css=BASE_CSS,
+                    tenants=tenants,
+                    tenant_clients_json=json.dumps(tenant_clients),
+                    default_client=default_client,
+                ),
+                400,
+            )
+
+        try:
+            verified_email, _ = verify_google_credential(
+                credential,
+                tenant,
+                email_hint=email_hint,
+            )
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return (
+                render_template_string(
+                    TPL_LOGIN,
+                    base_css=BASE_CSS,
+                    tenants=tenants,
+                    tenant_clients_json=json.dumps(tenant_clients),
+                    default_client=default_client,
+                ),
+                400,
+            )
+
+        email = verified_email
+        user_row = query_one(
+            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+            (email, tenant["id"]),
+        )
+        if not user_row:
+            role_row = query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
+                (tenant["id"],),
+            )
+            role = "admin" if (role_row["c"] == 0) else "user"
+            exec_write(
+                """
+                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    "google-oauth",
+                    role,
+                    datetime.utcnow().isoformat(),
+                    tenant["id"],
+                ),
+            )
+            user_row = query_one(
+                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+                (email, tenant["id"]),
+            )
+            flash(f"Welcome to {tenant['name']}! Account created via Google sign-in.", "ok")
+
+        login_user(User(user_row))
+        return redirect(url_for("home"))
+
+    return render_template_string(
+        TPL_LOGIN,
+        base_css=BASE_CSS,
+        tenants=tenants,
+        tenant_clients_json=json.dumps(tenant_clients),
+        default_client=default_client,
+    )
+
 @app.route("/register", methods=["GET","POST"])
 def register():
     flash("Registration is handled through Google sign-in. Use the login page to continue.", "error")
@@ -1767,6 +1958,7 @@ TPL_LOGIN = """
       }
       if (!window.google || !google.accounts || !google.accounts.id) {
         buttonRegion.innerHTML = '<div class=\"hint\">Loading Google sign-in...</div>';
+        buttonRegion.innerHTML = '<div class=\"hint\">Loading Google sign-in…</div>';
         setTimeout(renderGoogleButton, 400);
         return;
       }
