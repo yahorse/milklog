@@ -24,7 +24,7 @@ from flask_login import (
 
 # Google OAuth
 from authlib.integrations.flask_client import OAuth
-import requests # not used directly, but handy for debugging provider calls
+import requests  # not used directly, but handy for debugging provider calls
 
 try:
     from openpyxl import Workbook
@@ -146,16 +146,16 @@ def init_db():
           FOREIGN KEY(owner_id) REFERENCES users(id)
         )""")
         mcols = columns(conn, "milk_records")
-        if "session" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
-        if "note" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
-        if "tags" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
-        if "deleted" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
-        if "owner_id" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN owner_id INTEGER")
+        if "session"   not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
+        if "note"      not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
+        if "tags"      not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
+        if "deleted"   not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
+        if "owner_id"  not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN owner_id INTEGER")
         if "edited_at" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_date ON milk_records(record_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_cow ON milk_records(cow_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_cow  ON milk_records(cow_number)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_sess ON milk_records(session)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_del ON milk_records(deleted)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_del  ON milk_records(deleted)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_owner ON milk_records(owner_id)")
 
         # cows (kept for compatibility)
@@ -175,16 +175,16 @@ def init_db():
           FOREIGN KEY(owner_id) REFERENCES users(id)
         )""")
         ccols = columns(conn, "cows")
-        if "name" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN name TEXT")
-        if "breed" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN breed TEXT")
-        if "parity" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN parity INTEGER")
-        if "dob" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN dob TEXT")
+        if "name"           not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN name TEXT")
+        if "breed"          not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN breed TEXT")
+        if "parity"         not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN parity INTEGER")
+        if "dob"            not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN dob TEXT")
         if "latest_calving" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN latest_calving TEXT")
-        if "group_name" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN group_name TEXT")
-        if "owner_id" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN owner_id INTEGER")
-        if "created_at" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN created_at TEXT")
-        if "edited_at" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN edited_at TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_tag ON cows(tag)")
+        if "group_name"     not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN group_name TEXT")
+        if "owner_id"       not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN owner_id INTEGER")
+        if "created_at"     not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN created_at TEXT")
+        if "edited_at"      not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN edited_at TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_tag   ON cows(tag)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_group ON cows(group_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_owner ON cows(owner_id)")
 
@@ -411,7 +411,7 @@ def save_finance():
     require_csrf()
     try:
         price = float(request.form.get("milk_price_per_litre") or 0)
-        ccy = (request.form.get("currency") or "€").strip()[:3]
+        ccy   = (request.form.get("currency") or "€").strip()[:3]
         exec_write("UPDATE users SET milk_price_per_litre=?, currency=? WHERE id=?",
                    (price, ccy, current_user.id))
         flash("Finance settings saved.", "ok")
@@ -421,7 +421,7 @@ def save_finance():
 
 # -------- Core data ops --------
 def add_record(cow_number, litres, record_date_str, session_val, note, tags, owner_id):
-    _ = date.fromisoformat(record_date_str) # validate
+    _ = date.fromisoformat(record_date_str)  # validate
     if session_val not in ("AM","PM"):
         session_val = "AM"
     exec_write("""
@@ -476,4 +476,511 @@ def home():
     k = kpis_for_home(current_owner_id())
     return render_template_string(TPL_HOME,
         base_css=BASE_CSS, k=k,
-        to_d
+        to_display_litres=to_display_litres, unit_pref_for=unit_pref_for,
+        get_csrf_token=get_csrf_token
+    )
+
+@app.route("/new")
+@login_required
+def new_record_screen():
+    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=today_str(), get_csrf_token=get_csrf_token)
+
+@app.route("/add", methods=["POST"])
+@login_required
+def add():
+    cow = (request.form.get("cow_number") or "").strip()
+    litres = (request.form.get("litres") or "").strip()
+    session_val = (request.form.get("session") or "AM").strip()
+    note = (request.form.get("note") or "").strip()
+    tags = (request.form.get("tags") or "").strip()
+    record_date_str = (request.form.get("record_date") or today_str()).strip()
+    if not cow:
+        flash("Cow number is required", "error")
+        return redirect(url_for("new_record_screen"))
+    try:
+        litres_val = float(litres)
+        if litres_val < 0: raise ValueError
+    except ValueError:
+        flash("Litres must be a non-negative number", "error")
+        return redirect(url_for("new_record_screen"))
+    try:
+        add_record(cow, litres_val, record_date_str, session_val, note, tags, current_owner_id())
+    except ValueError:
+        flash("Bad date. Use YYYY-MM-DD.", "error")
+        return redirect(url_for("new_record_screen"))
+    except Exception as e:
+        flash(f"Error saving: {e}", "error")
+        return redirect(url_for("new_record_screen"))
+    flash("Saved!", "ok")
+    return redirect(url_for("new_record_screen"))
+
+@app.route("/records")
+@login_required
+def records_screen():
+    try:
+        last = int(request.args.get("last", "7"))
+    except ValueError:
+        last = 7
+    last = max(1, min(last, 90))
+    dates_desc = query("""
+        SELECT DISTINCT record_date
+        FROM milk_records
+        WHERE deleted=0 AND owner_id=?
+        ORDER BY record_date DESC
+        LIMIT ?
+    """, (current_owner_id(), last))
+    dates = list(reversed([r["record_date"] for r in dates_desc]))
+    sessions = ["AM","PM"]
+    rows=[]
+    if dates:
+        placeholders = ",".join("?" * len(dates))
+        data = query(f"""
+          SELECT cow_number, record_date, session, SUM(litres) AS litres
+          FROM milk_records
+          WHERE deleted=0 AND owner_id=? AND record_date IN ({placeholders})
+          GROUP BY cow_number, record_date, session
+        """, (current_owner_id(), *dates))
+        by_cow={}
+        for r in data:
+            by_cow.setdefault(r["cow_number"],{})
+            by_cow[r["cow_number"]][(r["record_date"], r["session"])] = float(r["litres"] or 0)
+        def cow_key(c):
+            try: return (0,int(c))
+            except: return (1,c)
+        for cow in sorted(by_cow.keys(), key=cow_key):
+            vals=[]; tot=0.0
+            for d in dates:
+                for s in sessions:
+                    v = by_cow[cow].get((d,s),0.0)
+                    vals.append(round(v,2)); tot+=v
+            rows.append({"cow":cow,"cells":vals,"total":round(tot,2)})
+    return render_template_string(TPL_RECORDS,
+        base_css=BASE_CSS, dates=dates, sessions=sessions, rows=rows,
+        last=last, get_csrf_token=get_csrf_token
+    )
+
+@app.route("/recent")
+@login_required
+def recent_screen():
+    try:
+        limit = int(request.args.get("limit","150"))
+    except ValueError:
+        limit = 150
+    limit = max(1, min(limit, 500))
+    rows = query("""
+      SELECT id, cow_number, litres, record_date, session, note, tags, created_at, edited_at, deleted
+      FROM milk_records
+      WHERE owner_id=?
+      ORDER BY id DESC
+      LIMIT ?
+    """, (current_owner_id(), limit))
+    msg = request.args.get("msg")
+    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, limit=limit, msg=msg, get_csrf_token=get_csrf_token)
+
+@app.route("/update/<int:rec_id>", methods=["POST"])
+@login_required
+def update(rec_id):
+    litres = request.form.get("litres")
+    session_val = request.form.get("session")
+    note = request.form.get("note","")
+    tags = request.form.get("tags","")
+    try:
+        litres_val = float(litres) if litres is not None else None
+        update_record(rec_id, litres_val, session_val, note, tags, current_owner_id())
+        return redirect(url_for("recent_screen", msg="Updated."))
+    except Exception as e:
+        return redirect(url_for("recent_screen", msg=f"Update failed: {e}"))
+
+@app.route("/delete/<int:rec_id>", methods=["POST"])
+@login_required
+def delete(rec_id):
+    soft_delete_record(rec_id, current_owner_id())
+    return redirect(url_for("recent_screen", msg="Deleted 1 entry (soft delete)."))
+
+@app.route("/restore/<int:rec_id>", methods=["POST"])
+@login_required
+def restore(rec_id):
+    restore_record(rec_id, current_owner_id())
+    return redirect(url_for("recent_screen", msg="Restored 1 entry."))
+
+# ----- CSV Import/Export -----
+@app.route("/import", methods=["GET", "POST"])
+@login_required
+def import_csv():
+    info=None
+    if request.method=="POST" and "file" in request.files:
+        f = request.files["file"]
+        try:
+            text = f.stream.read().decode("utf-8")
+            reader = csv.DictReader(io.StringIO(text))
+            count=0
+            for row in reader:
+                try:
+                    add_record(
+                        row["cow_number"], float(row["litres"]),
+                        row["record_date"], row.get("session","AM"),
+                        row.get("note","") or "", row.get("tags","") or "",
+                        current_owner_id()
+                    )
+                    count+=1
+                except Exception:
+                    pass
+            info=f"Imported {count} records."
+        except Exception as e:
+            info=f"Import failed: {e}"
+    return render_template_string(TPL_IMPORT, base_css=BASE_CSS, info=info, get_csrf_token=get_csrf_token)
+
+@app.route("/export.csv")
+@login_required
+def export_csv():
+    rows = query("""
+      SELECT id, cow_number, litres, record_date, session, note, tags, created_at, edited_at, deleted
+      FROM milk_records
+      WHERE owner_id=?
+      ORDER BY record_date DESC, id DESC
+    """, (current_owner_id(),))
+    out = io.StringIO(); w = csv.writer(out)
+    headers = ["id","cow_number","litres","record_date","session","note","tags","created_at","edited_at","deleted"]
+    w.writerow(headers)
+    for r in rows: w.writerow([r[h] for h in headers])
+    out.seek(0)
+    return send_file(io.BytesIO(out.read().encode("utf-8")), as_attachment=True,
+                     download_name="milk_records.csv", mimetype="text/csv")
+
+@app.route("/export.xlsx")
+@login_required
+def export_excel():
+    if Workbook is None:
+        return "Excel export not available (openpyxl not installed).", 503
+    data = query("""
+      SELECT id, cow_number, litres, record_date, session, note, tags, created_at
+      FROM milk_records
+      WHERE owner_id=? AND deleted=0
+      ORDER BY record_date ASC, cow_number ASC, id ASC
+    """, (current_owner_id(),))
+    wb = Workbook()
+    ws = wb.active; ws.title = "Raw Records"
+    ws.append(["ID","Cow #","Litres","Date","Session","Note","Tags","Saved (UTC)"])
+    for r in data:
+        ws.append([r["id"], r["cow_number"], r["litres"], r["record_date"], r["session"], r["note"] or "", r["tags"] or "", r["created_at"]])
+    for col, wdt in zip("ABCDEFGH", [8,10,10,12,10,25,25,25]): ws.column_dimensions[col].width = wdt
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
+    return send_file(bio, as_attachment=True, download_name="milk-records.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+# -------- Styles & Templates --------
+BASE_CSS = """
+:root{
+  --bg:#0b1220; --panel:#0f172a; --border:#223044; --text:#e5e7eb;
+  --muted:#9aa5b1; --accent:#22c55e; --accent-fore:#07220e;
+  --radius:18px; --shadow:0 14px 40px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 10% -10%, #0a1222 0, #0b1629 30%, #0f172a 70%), #0f172a;
+     color:var(--text);font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial}
+.wrap{max-width:880px;margin:0 auto;padding:22px}
+.top{display:flex;align-items:center;justify-content:space-between;margin:6px 2px 18px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:40px;height:40px}
+.title{font-weight:900;letter-spacing:.2px;font-size:22px}
+.kicker{color:var(--muted);font-size:12px;margin-top:-6px}
+.card{background:linear-gradient(180deg,#0c1324,#111a2f);border:1px solid var(--border);
+      border-radius:var(--radius);padding:18px 18px 16px;box-shadow:var(--shadow);margin-bottom:16px}
+.menu{display:grid;gap:12px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;background:var(--accent);color:var(--accent-fore);
+     font-weight:800;padding:12px 16px;border:none;border-radius:14px;cursor:pointer;text-decoration:none;text-align:center}
+.btn.secondary{background:#0b1220;color:var(--text);border:1px solid var(--border)}
+.btn.warn{background:#ef4444;color:#fff}
+.field{display:grid;gap:6px}
+label{font-size:13px;color:var(--muted)}
+input,select,textarea{background:#0b1220;border:1px solid var(--border);color:var(--text);padding:12px;border-radius:12px;font-size:16px;width:100%}
+.grid2{display:grid;gap:12px;grid-template-columns:1fr}
+@media(min-width:620px){.grid2{grid-template-columns:1fr 1fr}}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px;overflow-x:auto;display:block}
+thead, tbody { display: table; width: 100%; }
+th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+th{color:var(--muted);font-weight:600;background:#0b1220;position:sticky;top:0}
+tr:hover td{background:rgba(120,190,255,.06)}
+.hint{color:var(--muted);font-size:12px;text-align:center;margin-top:12px}
+.badge{display:inline-block;background:#0b1220;border:1px solid var(--border);color:var(--text);
+       border-radius:12px;padding:4px 10px;font-size:12px}
+.subtle{color:var(--muted);font-size:12px;text-align:center;margin-top:14px}
+.header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.hero{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px}
+.stat{background:#0b1220;border:1px dashed #1b2a3e;border-radius:12px;padding:12px}
+.stat .big{font-weight:900;font-size:22px}
+.flash{margin:8px 0;padding:10px;border-radius:10px}
+.flash.ok{background:#0e3821;border:1px solid #1c7f4b}
+.flash.error{background:#3b0e0e;border:1px solid #7f1d1d}
+small.muted{color:var(--muted)}
+a.link{color:#86efac;text-decoration:underline}
+"""
+
+TPL_LOGIN = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="card" style="max-width:520px;margin:40px auto">
+      <div class="top" style="margin-bottom:8px">
+        <div class="brand">
+          <svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg>
+          <div class="title">Milk Log</div>
+        </div>
+      </div>
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 14px">
+        <a class="btn" style="background:#ffffff;color:#111;border:1px solid #ccc"
+           href="{{ url_for('login_google') }}">
+          <svg width="18" height="18" viewBox="0 0 48 48" style="margin-right:6px">
+            <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.8 32.6 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3 0 5.7 1.1 7.8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 19-8.9 19-20c0-1.2-.1-2.3-.4-3.5z"/>
+            <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.5 16.3 18.9 13 24 13c3 0 5.7 1.1 7.8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 16.2 4 9.5 8.3 6.3 14.7z"/>
+            <path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.5-5.2l-6.2-5.2C29.3 36 26.8 37 24 37c-5.2 0-9.6-3.4-11.2-8.1l-6.6 5.1C9.4 39.7 16.1 44 24 44z"/>
+            <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1 2.9-3.2 5.2-6 6.5l6.2 5.2C37.1 41.9 43 36.9 43 28c0-2.5-.5-4.8-1.4-7.5z"/>
+          </svg>
+          Continue with Google
+        </a>
+      </div>
+
+      <form method="POST" class="grid2">
+        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
+        <div class="field"><label>Email</label><input name="email" type="email" required></div>
+        <div class="field"><label>Password</label><input name="password" type="password" required></div>
+        <div><button class="btn" type="submit">Sign in</button></div>
+      </form>
+      <div class="subtle" style="margin-top:10px">No account? <a class="link" href="{{ url_for('register') }}">Create one</a>.</div>
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_REGISTER = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Register</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="card" style="max-width:520px;margin:40px auto">
+      <div class="top" style="margin-bottom:8px">
+        <div class="brand">
+          <svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg>
+          <div class="title">Create Account</div>
+        </div>
+        <span class="badge">{{ 'First user will be admin' if default_role=='admin' else 'Role: user' }}</span>
+      </div>
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+      <form method="POST" class="grid2">
+        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
+        <div class="field"><label>Email</label><input name="email" type="email" required></div>
+        <div class="field"><label>Password</label><input name="password" type="password" required></div>
+        <div><button class="btn" type="submit">Create account</button></div>
+      </form>
+      <div class="subtle" style="margin-top:10px">Already have an account? <a class="link" href="{{ url_for('login') }}">Sign in</a>.</div>
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_HOME = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="/manifest.json">
+<script>navigator.serviceWorker?.register('/sw.js');</script>
+<title>Milk Log</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.7"/>
+          <circle cx="9" cy="11" r="1.6" fill="#22c55e"/><circle cx="15" cy="11" r="1.6" fill="#22c55e"/>
+        </svg>
+        <div>
+          <div class="title">Milk Log</div>
+          <div class="kicker">Fast, clean milk recording</div>
+        </div>
+      </div>
+      <span class="badge">Finance: price/L</span>
+    </div>
+
+    <div class="hero">
+      {% set v, u = to_display_litres(k.tot_litres) %}
+      <div class="stat"><div class="big">{{ v }} {{ u }}</div><div>Total today</div></div>
+
+      {% set v2, u2 = to_display_litres(k.milk_per_cow) %}
+      <div class="stat"><div class="big">{{ v2 }} {{ u2 }}</div><div>Milk per cow</div></div>
+
+      <div class="stat"><div class="big">{{ k.currency }} {{ '%.2f' % k.revenue_today }}</div><div>Revenue today</div></div>
+    </div>
+
+    <div class="card">
+      <div style="font-size:20px;font-weight:800;margin-bottom:10px">Main menu</div>
+      <div class="menu">
+        <a class="btn" href="{{ url_for('records_screen') }}">Cow Records</a>
+        <a class="btn secondary" href="{{ url_for('new_record_screen') }}">New Recording</a>
+        <a class="btn secondary" href="{{ url_for('recent_screen') }}">Recent Entries</a>
+        <a class="btn secondary" href="{{ url_for('import_csv') }}">Import CSV</a>
+        <a class="btn secondary" href="{{ url_for('export_csv') }}">Export CSV</a>
+        <a class="btn secondary" href="{{ url_for('export_excel') }}">Export Excel</a>
+        <a class="btn warn" href="{{ url_for('logout') }}">Logout</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-size:18px;font-weight:800;margin-bottom:6px">Finance</div>
+      <form method="POST" action="{{ url_for('save_finance') }}" class="grid2">
+        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
+        <div class="field">
+          <label>Milk price ({{ k.currency }}/L)</label>
+          <input type="number" step="0.001" name="milk_price_per_litre" placeholder="e.g. 0.52">
+        </div>
+        <div class="field">
+          <label>Currency (symbol or ISO)</label>
+          <input name="currency" maxlength="3" placeholder="€">
+        </div>
+        <div><button class="btn secondary" type="submit">Save</button></div>
+      </form>
+      <div class="hint">7-day avg revenue/day: <strong>{{ k.currency }} {{ '%.2f' % k.avg7_revenue_day }}</strong></div>
+    </div>
+
+    {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+    <div class="subtle">Set your price per litre to see revenue figures on this dashboard.</div>
+  </div>
+</body></html>
+"""
+
+TPL_NEW = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>New Recording</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">New Recording</div></div>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
+    </div>
+    {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+
+    <div class="card">
+      <form method="POST" action="{{ url_for('add') }}" class="grid2">
+        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
+        <div class="field"><label>Cow number</label><input name="cow_number" required></div>
+        <div class="field"><label>Litres</label><input name="litres" type="number" step="0.01" min="0" required></div>
+        <div class="field"><label>Date</label><input id="record_date" name="record_date" type="date" value="{{ today }}" required></div>
+        <div class="field"><label>Session</label>
+          <select name="session"><option>AM</option><option>PM</option></select>
+        </div>
+        <div class="field"><label>Tags (comma)</label><input name="tags" placeholder="fresh, high"></div>
+        <div class="field" style="grid-column:1/-1"><label>Note</label><textarea name="note" rows="3"></textarea></div>
+        <div style="grid-column:1/-1"><button class="btn" type="submit">Save</button></div>
+      </form>
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_RECORDS = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cow Records</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">Cow Records</div></div>
+      <div class="header-actions">
+        <a class="btn secondary" href="{{ url_for('records_screen', last=(request.args.get('last',7)|int - 3 if request.args.get('last') else 4)) }}">-3 days</a>
+        <span class="badge">Window: {{ last }} days</span>
+        <a class="btn secondary" href="{{ url_for('records_screen', last=(request.args.get('last',7)|int + 3 if request.args.get('last') else 10)) }}">+3 days</a>
+        <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
+      </div>
+    </div>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>Cow #</th>{% for d in dates %}{% for s in sessions %}<th>{{ d }} {{ s }}</th>{% endfor %}{% endfor %}<th>Total</th></tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr><td>{{ r.cow }}</td>{% for v in r.cells %}<td>{{ '%.2f'|format(v) }}</td>{% endfor %}<td><strong>{{ '%.2f'|format(r.total) }}</strong></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if not rows %}<div class="hint">No data yet for this window.</div>{% endif %}
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_RECENT = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recent Entries</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">Recent Entries</div></div>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
+    </div>
+    {% if msg %}<div class="flash ok">{{ msg }}</div>{% endif %}
+    <div class="card">
+      <table>
+        <thead><tr><th>ID</th><th>Cow</th><th>Litres</th><th>Date</th><th>Session</th><th>Tags</th><th>Note</th><th>Created</th><th>Edited</th><th>Actions</th></tr></thead>
+        <tbody>
+        {% for r in rows %}
+          <tr>
+            <td>{{ r['id'] }}</td>
+            <td>{{ r['cow_number'] }}</td>
+            <td>
+              <form method="POST" action="{{ url_for('update', rec_id=r['id']) }}" style="display:flex;gap:6px;align-items:center">
+                <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
+                <input name="litres" type="number" step="0.01" min="0" value="{{ '%.2f'|format(r['litres']) }}" style="width:90px">
+            </td>
+            <td>{{ r['record_date'] }}</td>
+            <td>
+                <select name="session"><option {% if r['session']=='AM' %}selected{% endif %}>AM</option><option {% if r['session']=='PM' %}selected{% endif %}>PM</option></select>
+            </td>
+            <td><input name="tags" value="{{ r['tags'] or '' }}" style="width:140px"></td>
+            <td><input name="note" value="{{ r['note'] or '' }}" style="width:180px"></td>
+            <td><small class="muted">{{ r['created_at'][:16] }}</small></td>
+            <td><small class="muted">{{ (r['edited_at'] or '')[:16] }}</small></td>
+            <td style="display:flex;gap:6px">
+                <button class="btn secondary" type="submit">Update</button></form>
+                {% if r['deleted']==0 %}
+                <form method="POST" action="{{ url_for('delete', rec_id=r['id']) }}"><input type="hidden" name="_csrf" value="{{ get_csrf_token() }}"><button class="btn warn" type="submit">Delete</button></form>
+                {% else %}
+                <form method="POST" action="{{ url_for('restore', rec_id=r['id']) }}"><input type="hidden" name="_csrf" value="{{ get_csrf_token() }}"><button class="btn" type="submit">Restore</button></form>
+                {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if not rows %}<div class="hint">No entries yet.</div>{% endif %}
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_IMPORT = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Import CSV</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top"><div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">Import CSV</div></div><a class="btn secondary" href="{{ url_for('home') }}">Back</a></div>
+    {% if info %}<div class="flash ok">{{ info }}</div>{% endif %}
+    <div class="card">
+      <form method="POST" enctype="multipart/form-data">
+        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
+        <div class="field"><label>CSV file</label><input type="file" name="file" accept=".csv" required></div>
+        <button class="btn" type="submit">Upload & Import</button>
+      </form>
+      <div class="hint">Headers: cow_number, litres, record_date, session, note, tags</div>
+    </div>
+  </div>
+</body></html>
+"""
+
+# -------- Local run --------
+if __name__ == "__main__":
+    app.config.update(SESSION_COOKIE_SAMESITE="Lax")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
