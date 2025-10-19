@@ -316,14 +316,20 @@ def throttle(ip, limit, per_seconds):
 
 @app.before_request
 def guards():
+    # Rate limit login/register
     if request.endpoint in {"login", "register"} and request.method == "POST":
         ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "x").split(",")[0].strip()
         if throttle(ip, limit=10, per_seconds=300):
             abort(429, description="Too many attempts. Please wait a moment.")
-    if request.method in ("POST","PUT","PATCH","DELETE"):
+        # Optionally: skip CSRF for these two endpoints
+        return
+
+    # CSRF for all other non-idempotent methods
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         if request.endpoint in {"service_worker", "manifest", "healthz"}:
             return
         require_csrf()
+
 
 # -------- Email/Password Auth --------
 @app.route("/login", methods=["GET","POST"])
