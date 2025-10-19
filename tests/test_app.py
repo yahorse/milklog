@@ -101,6 +101,39 @@ class MilkLogAppTests(unittest.TestCase):
                 response = self.client.get(url)
                 self.assertEqual(response.status_code, 200)
 
+    def test_can_setup_new_tenant_with_mock_credential(self):
+        self.client.get("/logout", follow_redirects=True)
+        new_slug = "fresh-dairy"
+        new_email = "owner@example.com"
+        new_token = "mock-new-token"
+
+        create = self.client.post(
+            "/tenant/setup",
+            data={
+                "name": "Fresh Dairy",
+                "slug": new_slug,
+                "google_client_id": "test-client-id",
+                "credential": new_token,
+                "mock_email": new_email,
+                "mock_credential": new_token,
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(create.status_code, 200)
+        self.assertIn("Milk Log", create.get_data(as_text=True))
+
+        self.client.get("/logout", follow_redirects=True)
+        login_resp = self.client.post(
+            "/login",
+            data={
+                "tenant": new_slug,
+                "credential": new_token,
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(login_resp.status_code, 200)
+        self.assertIn("Milk Log", login_resp.get_data(as_text=True))
+
     def test_add_record_flow(self):
         resp = self.client.post(
             "/add",
