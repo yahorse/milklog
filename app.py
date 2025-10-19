@@ -16,6 +16,7 @@ import io
 import csv
 import json
 import sqlite3
+import hashlib
 from contextlib import closing
 from datetime import datetime, date, timedelta
 
@@ -23,7 +24,6 @@ from flask import (
     Flask, request, redirect, url_for, render_template_string,
     send_file, flash, Response
 )
-from werkzeug.security import generate_password_hash, check_password_hash
 from flask_login import (
     LoginManager, UserMixin, login_user, login_required,
     logout_user, current_user
@@ -36,6 +36,72 @@ except Exception:
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-please-change")
+
+
+def load_tenant_settings():
+    """Load tenant metadata from environment configuration."""
+    raw = os.getenv("TENANT_SETTINGS")
+    settings = []
+    if raw:
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Invalid TENANT_SETTINGS JSON") from exc
+        if isinstance(loaded, dict):
+            loaded = [loaded]
+        if not isinstance(loaded, list):
+            raise RuntimeError("TENANT_SETTINGS must be a list or object")
+        settings = loaded
+    else:
+        default_slug = os.getenv("DEFAULT_TENANT_SLUG", "default")
+        default_name = os.getenv("DEFAULT_TENANT_NAME", "Default Tenant")
+        default_client_id = os.getenv("DEFAULT_GOOGLE_CLIENT_ID")
+        default_mock_email = os.getenv("DEFAULT_TENANT_MOCK_EMAIL")
+        default_mock_token = os.getenv("DEFAULT_TENANT_MOCK_CREDENTIAL")
+        entry = {
+            "slug": default_slug,
+            "name": default_name,
+            "google_client_id": default_client_id,
+        }
+        if default_mock_email and default_mock_token:
+            entry["mock_users"] = [
+                {"email": default_mock_email, "credential": default_mock_token}
+            ]
+        settings = [entry]
+
+    cleaned = []
+    for raw_entry in settings:
+        if not isinstance(raw_entry, dict):
+            continue
+        slug = (raw_entry.get("slug") or raw_entry.get("id") or "").strip()
+        if not slug:
+            continue
+        cleaned.append(
+            {
+                "slug": slug,
+                "name": (raw_entry.get("name") or slug.replace("-", " ").title()).strip(),
+                "google_client_id": raw_entry.get("google_client_id"),
+                "allowed_domains": raw_entry.get("allowed_domains") or [],
+                "mock_users": raw_entry.get("mock_users") or [],
+            }
+        )
+
+    if not cleaned:
+        cleaned = [
+            {
+                "slug": "default",
+                "name": "Default Tenant",
+                "google_client_id": None,
+                "allowed_domains": [],
+                "mock_users": [],
+            }
+        ]
+
+    return cleaned
+
+
+TENANT_SETTINGS = load_tenant_settings()
+TENANT_SETTINGS_LOOKUP = {cfg["slug"]: cfg for cfg in TENANT_SETTINGS}
 
 # ---------- Persistence ----------
 DATA_DIR = os.getenv("DATA_DIR", "/var/data")
@@ -53,6 +119,7 @@ class User(UserMixin):
         self.id = row["id"]
         self.email = row["email"]
         self.role = row["role"]  # 'admin' or 'user'
+        self.tenant_id = row["tenant_id"]
 
     @property
     def is_admin(self):
@@ -60,7 +127,7 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    row = query_one("SELECT id, email, role FROM users WHERE id=?", (user_id,))
+    row = query_one("SELECT id, email, role, tenant_id FROM users WHERE id=?", (user_id,))
     return User(row) if row else None
 
 # ---------- DB helpers ----------
@@ -83,6 +150,111 @@ def exec_write(sql, args=()):
     with closing(connect()) as conn, conn:
         conn.execute(sql, args)
 
+
+def sync_tenants(settings):
+    """Ensure tenant metadata exists and stays updated in the database."""
+    rows = query("SELECT id, slug FROM tenants")
+    existing = {r["slug"]: r for r in rows}
+    for entry in settings:
+        slug = entry["slug"]
+        name = entry.get("name") or slug.replace("-", " ").title()
+        client_id = entry.get("google_client_id")
+        if slug in existing:
+            exec_write(
+                "UPDATE tenants SET name=?, google_client_id=? WHERE id=?",
+                (name, client_id, existing[slug]["id"]),
+            )
+        else:
+            exec_write(
+                """
+                INSERT INTO tenants (slug, name, google_client_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (slug, name, client_id, datetime.utcnow().isoformat()),
+            )
+
+
+def list_tenants():
+    rows = query("SELECT id, slug, name, google_client_id FROM tenants ORDER BY name")
+    tenants = []
+    for row in rows:
+        cfg = TENANT_SETTINGS_LOOKUP.get(row["slug"], {})
+        tenants.append(
+            {
+                "id": row["id"],
+                "slug": row["slug"],
+                "name": row["name"],
+                "google_client_id": row["google_client_id"],
+                "allowed_domains": cfg.get("allowed_domains", []),
+                "mock_users": cfg.get("mock_users", []),
+            }
+        )
+    return tenants
+
+
+def tenant_by_slug(slug):
+    row = query_one("SELECT id, slug, name, google_client_id FROM tenants WHERE slug=?", (slug,))
+    if not row:
+        return None
+    cfg = TENANT_SETTINGS_LOOKUP.get(row["slug"], {})
+    return {
+        "id": row["id"],
+        "slug": row["slug"],
+        "name": row["name"],
+        "google_client_id": row["google_client_id"],
+        "allowed_domains": cfg.get("allowed_domains", []),
+        "mock_users": cfg.get("mock_users", []),
+    }
+
+
+def verify_google_credential(credential, tenant, email_hint=""):
+    """Validate a Google credential for a tenant, supporting mock fallbacks."""
+    credential = (credential or "").strip()
+    email_hint = (email_hint or "").strip().lower()
+    client_id = tenant.get("google_client_id")
+
+    if credential:
+        try:
+            from google.oauth2 import id_token  # type: ignore
+            from google.auth.transport import requests as google_requests  # type: ignore
+
+            idinfo = id_token.verify_oauth2_token(
+                credential,
+                google_requests.Request(),
+                client_id,
+            )
+            email = (idinfo.get("email") or "").strip().lower()
+            if not email:
+                raise ValueError("Google credential missing email claim.")
+            if email_hint and email_hint != email:
+                raise ValueError("Provided email does not match Google account.")
+            allowed_domains = tenant.get("allowed_domains") or []
+            if allowed_domains:
+                domain = email.split("@")[-1]
+                if domain not in {d.lower() for d in allowed_domains}:
+                    raise ValueError("Email domain is not allowed for this tenant.")
+            return email, idinfo
+        except Exception:
+            pass
+
+    mock_lookup = {}
+    for entry in tenant.get("mock_users", []):
+        token = (entry.get("credential") or "").strip()
+        email = (entry.get("email") or "").strip().lower()
+        if token and email:
+            mock_lookup[token] = email
+
+    if credential and credential in mock_lookup:
+        email = mock_lookup[credential]
+        if email_hint and email_hint != email:
+            raise ValueError("Provided email does not match Google account.")
+        return email, {
+            "iss": "mock",
+            "sub": hashlib.sha1(credential.encode("utf-8")).hexdigest(),
+        }
+
+    raise ValueError("Could not verify Google credential for this tenant.")
+
 # ---------- Schema & migrations ----------
 def column_names(conn, table):
     return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -97,8 +269,22 @@ def has_table(conn, table):
 def init_db():
     """Create/upgrade schema safely; idempotent migrations for old DBs."""
     with closing(connect()) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+
+        # --- tenants ---
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS tenants (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          slug TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          google_client_id TEXT,
+          created_at TEXT NOT NULL
+        )""")
+        tenant_cols = column_names(conn, "tenants")
+        if "google_client_id" not in tenant_cols:
+            conn.execute("ALTER TABLE tenants ADD COLUMN google_client_id TEXT")
 
         # --- users ---
         conn.execute("""
@@ -107,9 +293,47 @@ def init_db():
           email TEXT UNIQUE NOT NULL,
           password_hash TEXT NOT NULL,
           role TEXT NOT NULL CHECK(role IN ('admin','user')),
-          created_at TEXT NOT NULL
+          created_at TEXT NOT NULL,
+          tenant_id INTEGER,
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id)
         )""")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        user_cols = column_names(conn, "users")
+        if "tenant_id" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN tenant_id INTEGER")
+
+        # ensure default tenant exists
+        default_tenant = conn.execute(
+            "SELECT id FROM tenants WHERE slug=?",
+            (TENANT_SETTINGS[0]["slug"],),
+        ).fetchone()
+        if not default_tenant:
+            conn.execute(
+                """
+                INSERT INTO tenants (slug, name, google_client_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    TENANT_SETTINGS[0]["slug"],
+                    TENANT_SETTINGS[0]["name"],
+                    TENANT_SETTINGS[0]["google_client_id"],
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            default_tenant = conn.execute(
+                "SELECT id FROM tenants WHERE slug=?",
+                (TENANT_SETTINGS[0]["slug"],),
+            ).fetchone()
+
+        default_tenant_id = default_tenant["id"] if default_tenant else 1
+        conn.execute(
+            "UPDATE users SET tenant_id=? WHERE tenant_id IS NULL",
+            (default_tenant_id,),
+        )
+
+        conn.execute("DROP INDEX IF EXISTS idx_users_email")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_email ON users(tenant_id, email)"
+        )
 
         # --- milk_records ---
         conn.execute("""
@@ -225,6 +449,7 @@ def init_db():
 
 # run migrations on import
 init_db()
+sync_tenants(TENANT_SETTINGS)
 
 # ---------- Utility ----------
 def today_str():
@@ -325,41 +550,78 @@ def alerts_compute(owner_id):
 # ---------- Auth routes ----------
 @app.route("/login", methods=["GET","POST"])
 def login():
+    tenants = list_tenants()
+    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
+
     if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        password = request.form.get("password") or ""
-        row = query_one("SELECT id, email, password_hash, role FROM users WHERE email=?", (email,))
-        if row and check_password_hash(row["password_hash"], password):
-            login_user(User(row))
-            return redirect(url_for("home"))
-        flash("Invalid email or password", "error")
-    return render_template_string(TPL_LOGIN, base_css=BASE_CSS)
+        tenant_slug = (request.form.get("tenant") or "").strip()
+        email_hint = (request.form.get("email") or "").strip().lower()
+        credential = request.form.get("credential") or request.form.get("mock_credential")
+        tenant = tenant_by_slug(tenant_slug)
+        if not tenant:
+            flash("Unknown tenant selected.", "error")
+            return render_template_string(
+                TPL_LOGIN,
+                base_css=BASE_CSS,
+                tenants=tenants,
+                tenant_clients_json=json.dumps(tenant_clients),
+            )
+
+        try:
+            verified_email, _ = verify_google_credential(credential, tenant, email_hint=email_hint)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return render_template_string(
+                TPL_LOGIN,
+                base_css=BASE_CSS,
+                tenants=tenants,
+                tenant_clients_json=json.dumps(tenant_clients),
+            )
+
+        email = verified_email
+        user_row = query_one(
+            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+            (email, tenant["id"]),
+        )
+        if not user_row:
+            role_row = query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
+                (tenant["id"],),
+            )
+            role = "admin" if (role_row["c"] == 0) else "user"
+            exec_write(
+                """
+                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    "google-oauth",
+                    role,
+                    datetime.utcnow().isoformat(),
+                    tenant["id"],
+                ),
+            )
+            user_row = query_one(
+                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
+                (email, tenant["id"]),
+            )
+            flash(f"Welcome to {tenant['name']}! Account created via Google sign-in.", "ok")
+
+        login_user(User(user_row))
+        return redirect(url_for("home"))
+
+    return render_template_string(
+        TPL_LOGIN,
+        base_css=BASE_CSS,
+        tenants=tenants,
+        tenant_clients_json=json.dumps(tenant_clients),
+    )
 
 @app.route("/register", methods=["GET","POST"])
 def register():
-    # If no users exist, first registrant becomes admin; else role=user
-    any_user = query_one("SELECT id FROM users LIMIT 1")
-    default_role = "admin" if not any_user else "user"
-
-    if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        password = request.form.get("password") or ""
-        if not email or not password:
-            flash("Email and password required", "error")
-            return redirect(url_for("register"))
-        try:
-            exec_write("""
-              INSERT INTO users (email, password_hash, role, created_at)
-              VALUES (?, ?, ?, ?)
-            """, (email, generate_password_hash(password), default_role, datetime.utcnow().isoformat()))
-            row = query_one("SELECT id, email, role FROM users WHERE email=?", (email,))
-            login_user(User(row))
-            flash("Account created.", "ok")
-            return redirect(url_for("home"))
-        except Exception as e:
-            flash(f"Registration failed: {e}", "error")
-            return redirect(url_for("register"))
-    return render_template_string(TPL_REGISTER, base_css=BASE_CSS, default_role=default_role)
+    flash("Registration is handled through Google sign-in. Use the login page to continue.", "error")
+    return redirect(url_for("login"))
 
 @app.route("/logout")
 @login_required
@@ -968,6 +1230,7 @@ body{margin:0;background:radial-gradient(1200px 600px at 10% -10%, #0a1222 0, #0
 label{font-size:13px;color:var(--muted)}
 input,select,textarea{background:#0b1220;border:1px solid var(--border);color:var(--text);padding:12px;border-radius:12px;font-size:16px;width:100%}
 .grid2{display:grid;gap:12px;grid-template-columns:1fr}
+.grid2 .full{grid-column:1/-1}
 @media(min-width:620px){.grid2{grid-template-columns:1fr 1fr}}
 table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px;overflow-x:auto;display:block}
 thead, tbody { display: table; width: 100%; }
@@ -1001,22 +1264,69 @@ TPL_LOGIN = """
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Login</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
-    <div class="card" style="max-width:520px;margin:40px auto">
-      <div class="top" style="margin-bottom:8px">
+    <div class="card" style="max-width:560px;margin:40px auto">
+      <div class="top" style="margin-bottom:12px">
         <div class="brand">
           <svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg>
           <div class="title">Milk Log</div>
         </div>
       </div>
+      <p class="muted" style="margin-bottom:10px">Sign in with your Google account for the correct tenant workspace.</p>
       {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-      <form method="POST" class="grid2">
-        <div class="field"><label>Email</label><input name="email" type="email" required></div>
-        <div class="field"><label>Password</label><input name="password" type="password" required></div>
-        <div><button class="btn" type="submit">Sign in</button></div>
+      <form method="POST" class="grid2 login-form">
+        <div class="field"><label>Tenant</label>
+          <select name="tenant" required>
+            {% for tenant in tenants %}
+            <option value="{{ tenant.slug }}">{{ tenant.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field"><label>Email</label><input name="email" type="email" placeholder="you@company.com" required></div>
+        <input type="hidden" name="credential" value="">
+        <div class="field full">
+          <label>Google credential (paste ID token or mock credential)</label>
+          <input name="mock_credential" type="text" placeholder="Paste Google credential if button unavailable">
+        </div>
+        <div class="full"><button class="btn" type="submit">Continue with Google</button></div>
       </form>
-      <div class="subtle" style="margin-top:10px">No account? <a class="link" href="{{ url_for('register') }}">Create one</a>.</div>
+      <div class="hint">Use the mock credential field when running in offline or testing environments.</div>
+      <div class="hint">When Google One Tap is available, use the button below for a seamless sign in.</div>
+      <div id="google-buttons" style="margin-top:16px"></div>
     </div>
   </div>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script>
+    const tenantClients = {{ tenant_clients_json|safe }};
+    const form = document.querySelector('form.login-form');
+    const tenantSelect = form.querySelector('select[name="tenant"]');
+    const credentialInput = form.querySelector('input[name="credential"]');
+    const mockInput = form.querySelector('input[name="mock_credential"]');
+    const buttonRegion = document.getElementById('google-buttons');
+
+    function renderGoogleButton() {
+      buttonRegion.innerHTML = '';
+      const clientId = tenantClients[tenantSelect.value];
+      if (!clientId || !window.google || !google.accounts || !google.accounts.id) {
+        return;
+      }
+      google.accounts.id.initialize({
+        client_id: clientId,
+        callback: (response) => {
+          credentialInput.value = response.credential;
+          mockInput.value = '';
+          form.submit();
+        },
+      });
+      const btn = document.createElement('div');
+      buttonRegion.appendChild(btn);
+      google.accounts.id.renderButton(btn, { theme: 'outline', size: 'large', text: 'signin_with' });
+    }
+
+    window.addEventListener('load', () => {
+      renderGoogleButton();
+      tenantSelect.addEventListener('change', renderGoogleButton);
+    });
+  </script>
 </body></html>
 """
 
