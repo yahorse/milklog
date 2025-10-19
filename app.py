@@ -99,35 +99,41 @@ def init_db():
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
 
-        # users (auth + finance + google fields)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          email TEXT UNIQUE NOT NULL,
-          password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK(role IN ('admin','user')),
-          created_at TEXT NOT NULL,
-          unit_pref TEXT DEFAULT 'L',
-          milk_price_per_litre REAL DEFAULT 0.0,
-          currency TEXT DEFAULT '€',
-          google_sub TEXT UNIQUE,
-          name TEXT,
-          avatar TEXT
-        )""")
-        ucols = columns(conn, "users")
-        if "unit_pref" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT DEFAULT 'L'")
-        if "milk_price_per_litre" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN milk_price_per_litre REAL DEFAULT 0.0")
-        if "currency" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '€'")
-        if "google_sub" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT UNIQUE")
-        if "name" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
-        if "avatar" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    # users (auth + finance + google fields)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('admin','user')),
+  created_at TEXT NOT NULL,
+  unit_pref TEXT DEFAULT 'L',
+  milk_price_per_litre REAL DEFAULT 0.0,
+  currency TEXT DEFAULT '€',
+  google_sub TEXT,             -- no UNIQUE here; enforce via index
+  name TEXT,
+  avatar TEXT
+)""")
+
+ucols = columns(conn, "users")
+if "unit_pref" not in ucols:
+    conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT DEFAULT 'L'")
+if "milk_price_per_litre" not in ucols:
+    conn.execute("ALTER TABLE users ADD COLUMN milk_price_per_litre REAL DEFAULT 0.0")
+if "currency" not in ucols:
+    conn.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '€'")
+if "google_sub" not in ucols:
+    # IMPORTANT: add without UNIQUE; uniqueness is enforced by an index below
+    conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+if "name" not in ucols:
+    conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
+if "avatar" not in ucols:
+    conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+
+# Uniqueness: email is already unique; make google_sub unique via an index
+conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
+
 
         # milk_records
         conn.execute("""
