@@ -556,6 +556,7 @@ def login():
     if request.method == "POST":
         tenant_slug = (request.form.get("tenant") or "").strip()
         email_hint = (request.form.get("email") or "").strip().lower()
+        credential = request.form.get("credential")
         credential = request.form.get("credential") or request.form.get("mock_credential")
         tenant = tenant_by_slug(tenant_slug)
         if not tenant:
@@ -1271,6 +1272,9 @@ TPL_LOGIN = """
           <div class="title">Milk Log</div>
         </div>
       </div>
+      <p class="muted" style="margin-bottom:10px">Choose your tenant and sign in with Google.</p>
+      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
+      <form method="POST" class="login-form">
       <p class="muted" style="margin-bottom:10px">Sign in with your Google account for the correct tenant workspace.</p>
       {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
       <form method="POST" class="grid2 login-form">
@@ -1281,6 +1285,9 @@ TPL_LOGIN = """
             {% endfor %}
           </select>
         </div>
+        <input type="hidden" name="credential" value="">
+        <div class="full hint">Use the Google button below to continue.</div>
+      </form>
         <div class="field"><label>Email</label><input name="email" type="email" placeholder="you@company.com" required></div>
         <input type="hidden" name="credential" value="">
         <div class="field full">
@@ -1306,6 +1313,12 @@ TPL_LOGIN = """
     function renderGoogleButton() {
       buttonRegion.innerHTML = '';
       const clientId = tenantClients[tenantSelect.value];
+      if (!clientId) {
+        buttonRegion.innerHTML = '<div class="hint">Google sign-in is not configured for this tenant.</div>';
+        return;
+      }
+      if (!window.google || !google.accounts || !google.accounts.id) {
+        buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in…</div>';
       if (!clientId || !window.google || !google.accounts || !google.accounts.id) {
         return;
       }
