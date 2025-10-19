@@ -115,18 +115,11 @@ class MilkLogAppTests(unittest.TestCase):
                 "workspace_name": "Fresh Dairy",
                 "credential": new_token,
                 "email_hint": new_email,
-            "/tenant/setup",
-            data={
-                "name": "Fresh Dairy",
-                "slug": new_slug,
-                "google_client_id": "test-client-id",
-                "credential": new_token,
-                "mock_email": new_email,
-                "mock_credential": new_token,
             },
             follow_redirects=True,
         )
         self.assertEqual(create.status_code, 200)
+
         self.assertIn("Milk Log", create.get_data(as_text=True))
 
         self.client.get("/logout", follow_redirects=True)

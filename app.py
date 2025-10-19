@@ -1,5 +1,5 @@
 # app.py
-# Milk Log v4 — Single-file Flask app with Authentication & Multi-tenant data isolation
+# Milk Log v4 - Single-file Flask app with Authentication & Multi-tenant data isolation
 # Adds:
 # - Users (email/password), login/logout/register (Flask-Login)
 # - Admin role (first user created becomes admin)
@@ -209,7 +209,6 @@ def list_tenants():
                 "google_client_id": row["google_client_id"],
                 "allowed_domains": cfg.get("allowed_domains", []),
                 "mock_users": mock_users,
-                "mock_users": cfg.get("mock_users", []),
             }
         )
     return tenants
@@ -229,7 +228,6 @@ def tenant_by_slug(slug):
         "google_client_id": row["google_client_id"],
         "allowed_domains": cfg.get("allowed_domains", []),
         "mock_users": mock_users,
-        "mock_users": cfg.get("mock_users", []),
     }
 
 
@@ -924,149 +922,6 @@ def tenant_setup():
         form_values=form_values,
         default_client=default_client,
     )
-
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    tenants = list_tenants()
-    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
-
-    if request.method == "POST":
-        tenant_slug = (request.form.get("tenant") or "").strip()
-        email_hint = (request.form.get("email") or "").strip().lower()
-        credential = request.form.get("credential")
-        tenant = tenant_by_slug(tenant_slug)
-        if not tenant:
-            flash("Unknown tenant selected.", "error")
-            return render_template_string(
-                TPL_LOGIN,
-                base_css=BASE_CSS,
-                tenants=tenants,
-                tenant_clients_json=json.dumps(tenant_clients),
-            )
-
-        try:
-            verified_email, _ = verify_google_credential(credential, tenant, email_hint=email_hint)
-        except ValueError as exc:
-            flash(str(exc), "error")
-            return render_template_string(
-                TPL_LOGIN,
-                base_css=BASE_CSS,
-                tenants=tenants,
-                tenant_clients_json=json.dumps(tenant_clients),
-            )
-
-        email = verified_email
-        user_row = query_one(
-            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
-            (email, tenant["id"]),
-        )
-        if not user_row:
-            role_row = query_one(
-                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
-                (tenant["id"],),
-            )
-            role = "admin" if (role_row["c"] == 0) else "user"
-            exec_write(
-                """
-                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    email,
-                    "google-oauth",
-                    role,
-                    datetime.utcnow().isoformat(),
-                    tenant["id"],
-                ),
-            )
-            user_row = query_one(
-                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
-                (email, tenant["id"]),
-            )
-            flash(f"Welcome to {tenant['name']}! Account created via Google sign-in.", "ok")
-
-        login_user(User(user_row))
-        return redirect(url_for("home"))
-
-    return render_template_string(
-        TPL_LOGIN,
-        base_css=BASE_CSS,
-        tenants=tenants,
-        tenant_clients_json=json.dumps(tenant_clients),
-    )
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    tenants = list_tenants()
-    tenant_clients = {t["slug"]: t.get("google_client_id") for t in tenants}
-
-    if request.method == "POST":
-        tenant_slug = (request.form.get("tenant") or "").strip()
-        email_hint = (request.form.get("email") or "").strip().lower()
-        credential = request.form.get("credential")
-        credential = request.form.get("credential") or request.form.get("mock_credential")
-        tenant = tenant_by_slug(tenant_slug)
-        if not tenant:
-            flash("Unknown tenant selected.", "error")
-            return render_template_string(
-                TPL_LOGIN,
-                base_css=BASE_CSS,
-                tenants=tenants,
-                tenant_clients_json=json.dumps(tenant_clients),
-            )
-
-        try:
-            verified_email, _ = verify_google_credential(credential, tenant, email_hint=email_hint)
-        except ValueError as exc:
-            flash(str(exc), "error")
-            return render_template_string(
-                TPL_LOGIN,
-                base_css=BASE_CSS,
-                tenants=tenants,
-                tenant_clients_json=json.dumps(tenant_clients),
-            )
-
-        email = verified_email
-        user_row = query_one(
-            "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
-            (email, tenant["id"]),
-        )
-        if not user_row:
-            role_row = query_one(
-                "SELECT COUNT(*) AS c FROM users WHERE tenant_id=?",
-                (tenant["id"],),
-            )
-            role = "admin" if (role_row["c"] == 0) else "user"
-            exec_write(
-                """
-                INSERT INTO users (email, password_hash, role, created_at, tenant_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    email,
-                    "google-oauth",
-                    role,
-                    datetime.utcnow().isoformat(),
-                    tenant["id"],
-                ),
-            )
-            user_row = query_one(
-                "SELECT id, email, role, tenant_id FROM users WHERE email=? AND tenant_id=?",
-                (email, tenant["id"]),
-            )
-            flash(f"Welcome to {tenant['name']}! Account created via Google sign-in.", "ok")
-
-        login_user(User(user_row))
-        return redirect(url_for("home"))
-
-    return render_template_string(
-        TPL_LOGIN,
-        base_css=BASE_CSS,
-        tenants=tenants,
-        tenant_clients_json=json.dumps(tenant_clients),
-    )
-
 @app.route("/register", methods=["GET","POST"])
 def register():
     flash("Registration is handled through Google sign-in. Use the login page to continue.", "error")
@@ -1162,7 +1017,11 @@ def manifest():
         "background_color": "#0f172a",
         "theme_color": "#22c55e",
         "icons": [
-            {"src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='192' height='192'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='55%' font-size='100' text-anchor='middle' fill='%2322c55e'>🐄</text></svg>", "sizes": "192x192", "type": "image/svg+xml"}
+            {
+                "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='192' height='192'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='55%' font-size='100' text-anchor='middle' fill='%2322c55e'>&#128004;</text></svg>",
+                "sizes": "192x192",
+                "type": "image/svg+xml",
+            }
         ]
     }
     return Response(json.dumps(data), mimetype="application/json")
@@ -1792,7 +1651,7 @@ TPL_TENANT_SETUP = """
         return;
       }
       if (!window.google || !google.accounts || !google.accounts.id) {
-        buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in…</div>';
+        buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in...</div>';
         return;
       }
       google.accounts.id.initialize({
@@ -1834,9 +1693,13 @@ TPL_LOGIN = """
           <div class="title">Milk Log</div>
         </div>
       </div>
-      <p class="muted" style="margin-bottom:10px">Sign in with Google. Enter a new workspace ID to create one.</p>
-      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-      <form method="POST" class="login-form">
+      <p class="muted" style="margin-bottom:10px">Sign in with Google to access your workspace.</p>
+      {% with msgs = get_flashed_messages(with_categories=true) %}
+        {% if msgs %}
+          {% for cat, m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}
+        {% endif %}
+      {% endwith %}
+      <form method="POST" class="login-form" id="login-form">
         <div class="field"><label>Workspace ID</label>
           <input name="tenant" list="tenant-options" placeholder="e.g. dairy-one" required>
           <datalist id="tenant-options">
@@ -1845,52 +1708,35 @@ TPL_LOGIN = """
             {% endfor %}
           </datalist>
         </div>
-        <div class="field"><label>Workspace name (for new workspaces)</label><input name="workspace_name" placeholder="Fresh Dairy"></div>
-        <input type="hidden" name="credential" value="">
+        <div class="field"><label>Email</label><input name="email" type="email" placeholder="you@company.com"></div>
         <input type="hidden" name="email_hint" value="">
-        <div class="full hint">Use the Google button below to continue.</div>
-      </form>
-      <div id="google-buttons" style="margin-top:16px"></div>
-      <p class="muted" style="margin-bottom:10px">Choose your tenant and sign in with Google.</p>
-      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-      <form method="POST" class="login-form">
-      <p class="muted" style="margin-bottom:10px">Sign in with your Google account for the correct tenant workspace.</p>
-      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-      <form method="POST" class="grid2 login-form">
-        <div class="field"><label>Tenant</label>
-          <select name="tenant" required>
-            {% for tenant in tenants %}
-            <option value="{{ tenant.slug }}">{{ tenant.name }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <input type="hidden" name="credential" value="">
-        <div class="full hint">Use the Google button below to continue.</div>
-      </form>
-      <div id="google-buttons" style="margin-top:16px"></div>
-      <div class="hint" style="margin-top:18px">Setting up a new workspace? <a class="link" href="{{ url_for('tenant_setup') }}">Create it with Google</a>.</div>
-        <div class="field"><label>Email</label><input name="email" type="email" placeholder="you@company.com" required></div>
         <input type="hidden" name="credential" value="">
         <div class="field full">
-          <label>Google credential (paste ID token or mock credential)</label>
+          <label>Mock credential (optional)</label>
           <input name="mock_credential" type="text" placeholder="Paste Google credential if button unavailable">
         </div>
-        <div class="full"><button class="btn" type="submit">Continue with Google</button></div>
+        <div class="full hint">Use the Google button for a one-click sign in, or paste a mock credential above when testing.</div>
+        <div class="full"><button class="btn" type="submit">Continue</button></div>
       </form>
-      <div class="hint">Use the mock credential field when running in offline or testing environments.</div>
-      <div class="hint">When Google One Tap is available, use the button below for a seamless sign in.</div>
+      <div class="hint" style="margin-top:18px">Need a workspace? <a class="link" href="{{ url_for('tenant_setup') }}">Create one with Google</a>.</div>
       <div id="google-buttons" style="margin-top:16px"></div>
     </div>
   </div>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script>
     const tenantClients = {{ tenant_clients_json|safe }};
-    const form = document.querySelector('form.login-form');
+    const defaultClient = {{ (default_client or "")|tojson }};
+    const form = document.getElementById('login-form');
     const tenantInput = form.querySelector('input[name="tenant"]');
-    const credentialInput = form.querySelector('input[name="credential"]');
+    const emailInput = form.querySelector('input[name="email"]');
     const emailHintInput = form.querySelector('input[name="email_hint"]');
-    const defaultClient = {{ (default_client or "null")|tojson }};
+    const credentialInput = form.querySelector('input[name="credential"]');
+    const mockInput = form.querySelector('input[name="mock_credential"]');
     const buttonRegion = document.getElementById('google-buttons');
+
+    function slugify(value) {
+      return (value || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    }
 
     function extractEmail(token) {
       if (!token) return '';
@@ -1907,57 +1753,61 @@ TPL_LOGIN = """
       }
     }
 
-    function resolveClientId(slug) {
+    function resolveClientId(value) {
+      const slug = slugify(value);
       return tenantClients[slug] || defaultClient || '';
     }
 
     function renderGoogleButton() {
       buttonRegion.innerHTML = '';
-      const clientId = resolveClientId(tenantInput.value.trim());
-    const tenantSelect = form.querySelector('select[name="tenant"]');
-    const credentialInput = form.querySelector('input[name="credential"]');
-    const mockInput = form.querySelector('input[name="mock_credential"]');
-    const buttonRegion = document.getElementById('google-buttons');
-
-    function renderGoogleButton() {
-      buttonRegion.innerHTML = '';
-      const clientId = tenantClients[tenantSelect.value];
+      const clientId = resolveClientId(tenantInput.value);
       if (!clientId) {
-        buttonRegion.innerHTML = '<div class="hint">Google sign-in is not configured for this tenant.</div>';
+        buttonRegion.innerHTML = '<div class=\"hint\">Google sign-in is not configured for this workspace yet.</div>';
         return;
       }
       if (!window.google || !google.accounts || !google.accounts.id) {
-        buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in…</div>';
-      if (!clientId || !window.google || !google.accounts || !google.accounts.id) {
+        buttonRegion.innerHTML = '<div class=\"hint\">Loading Google sign-in...</div>';
+        setTimeout(renderGoogleButton, 400);
         return;
       }
       google.accounts.id.initialize({
         client_id: clientId,
         callback: (response) => {
           credentialInput.value = response.credential;
-          const email = extractEmail(response.credential);
-          if (email) {
-            emailHintInput.value = email;
-          }
+          emailHintInput.value = extractEmail(response.credential);
           mockInput.value = '';
-          form.submit();
+          const slug = slugify(tenantInput.value);
+          if (slug) {
+            tenantInput.value = slug;
+            form.submit();
+          } else {
+            tenantInput.focus();
+          }
         },
       });
       const btn = document.createElement('div');
       buttonRegion.appendChild(btn);
-      google.accounts.id.renderButton(btn, { theme: 'outline', size: 'large', text: 'signin_with' });
+      google.accounts.id.renderButton(btn, { theme: 'filled_blue', size: 'large', text: 'continue_with' });
     }
 
-    window.addEventListener('load', () => {
+    tenantInput.addEventListener('input', () => {
+      credentialInput.value = '';
+      emailHintInput.value = '';
       renderGoogleButton();
-      tenantInput.addEventListener('input', () => {
-        emailHintInput.value = '';
-        renderGoogleButton();
-      });
-      tenantSelect.addEventListener('change', renderGoogleButton);
     });
+
+    form.addEventListener('submit', () => {
+      const slug = slugify(tenantInput.value);
+      tenantInput.value = slug;
+      if (!credentialInput.value) {
+        emailHintInput.value = (emailInput.value || '').trim().toLowerCase();
+      }
+    });
+
+    window.addEventListener('load', renderGoogleButton);
   </script>
 </body></html>
+
 """
 
 TPL_REGISTER = """
@@ -2070,7 +1920,7 @@ TPL_HOME = """
       </div>
     </div>
 
-    <div class="subtle">Install to Home Screen for an app-like experience • Data is scoped to your login • Export anytime.</div>
+    <div class="subtle">Install to Home Screen for an app-like experience &bull; Data is scoped to your login &bull; Export anytime.</div>
   </div>
 </body></html>
 """
@@ -2190,7 +2040,7 @@ TPL_RECENT = """
             <td>{{ r.session }}</td>
             <td>{{ '%.2f'|format(r.litres) }}</td>
             <td>{% if r.price_per_litre is not none %}{{ '%.2f'|format(r.price_per_litre) }}{% else %}<span class="pill">No price</span>{% endif %}</td>
-            <td>{% if r.gain is not none %}{{ '%.2f'|format(r.gain) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td>{% if r.gain is not none %}{{ '%.2f'|format(r.gain) }}{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
             <td>
               <form method="POST" action="{{ url_for('update', rec_id=r.id) }}" class="stacked-form">
                 <div class="inline-actions">
