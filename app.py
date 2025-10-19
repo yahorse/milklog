@@ -1,30 +1,23 @@
 # app.py
-# Milk Log – Flask app with Google Login, per-user data, and schema migration
-# - Google OAuth (Authlib), per-user isolation via owner_sub
-# - Migration-safe DB init (adds owner_sub if missing, creates indexes)
-# - Claim legacy rows (NULL owner_sub) for first logged-in user
+# Milk Log – Flask app (no login) with a professional mobile-first UI
+# - Enter Cow Number, Litres, Date (YYYY-MM-DD)
+# - Cow Records: dynamic columns by date (same cow+date sums)
+# - Recent Entries with Delete
+# - Export to Excel (raw + pivot)
 # - Render-ready: persistent SQLite on /var/data, WAL mode
-# - Features: add, pivot-by-date, recent+delete, export.xlsx, optional backup, healthz
+# - Health check route
 
 import os
 import io
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
-from functools import wraps
 
-from flask import (
-    Flask, request, redirect, url_for, render_template_string,
-    send_file, session, abort
-)
-from openpyxl import Workbook
-from authlib.integrations.flask_client import OAuth
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
 
 app = Flask(__name__)
 
-# ---------- Config & Persistence ----------
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-please-change")
-
+# ----------- Persistence (Render) -----------
 DATA_DIR = os.getenv("DATA_DIR", "/var/data")
 if not os.path.isdir(DATA_DIR):
     DATA_DIR = "."
@@ -32,136 +25,103 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
-BACKUP_TOKEN = os.getenv("BACKUP_TOKEN")
-
-# ---------- OAuth (Google) ----------
-oauth = OAuth(app)
-if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
-    oauth.register(
-        name="google",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-        client_kwargs={"scope": "openid email profile"},
-    )
-
-def login_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if "user" not in session:
-            return redirect(url_for("login", next=request.path))
-        return f(*args, **kwargs)
-    return wrapper
-
-def current_owner_sub() -> str:
-    u = session.get("user")
-    return u["sub"] if u else None
-
-# ---------- DB helpers ----------
+# ----------- DB helpers -----------
 def init_db():
-    """Create/upgrade schema safely (handles legacy DB without owner_sub)."""
+    """Create/upgrade schema safely."""
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-
-        # Ensure table exists (owner_sub nullable so we can migrate legacy rows)
         conn.execute("""
           CREATE TABLE IF NOT EXISTS milk_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_sub TEXT,
             cow_number TEXT NOT NULL,
             litres REAL NOT NULL CHECK(litres >= 0),
-            record_date TEXT NOT NULL,       -- YYYY-MM-DD
-            created_at TEXT NOT NULL         -- ISO (UTC)
+            record_date TEXT NOT NULL,        -- YYYY-MM-DD
+            created_at TEXT NOT NULL          -- ISO (UTC)
           )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON milk_records(record_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cow  ON milk_records(cow_number)")
 
-        # MIGRATION: add owner_sub column if missing on very old DBs
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(milk_records)").fetchall()]
-        if "owner_sub" not in cols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN owner_sub TEXT")
-
-        # Indexes (safe to create repeatedly)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_date ON milk_records(owner_sub, record_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_cow  ON milk_records(owner_sub, cow_number)")
-
-def add_record(owner_sub: str, cow_number: str, litres: float, record_date_str: str):
+def add_record(cow_number: str, litres: float, record_date_str: str):
+    # Validate date format
     _ = date.fromisoformat(record_date_str)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
-          INSERT INTO milk_records (owner_sub, cow_number, litres, record_date, created_at)
-          VALUES (?, ?, ?, ?, ?)
-        """, (owner_sub, cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()))
+          INSERT INTO milk_records (cow_number, litres, record_date, created_at)
+          VALUES (?, ?, ?, ?)
+        """, (cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()))
 
-def delete_record(owner_sub: str, rec_id: int) -> int:
+def delete_record(rec_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        cur = conn.execute("DELETE FROM milk_records WHERE id = ? AND owner_sub = ?", (rec_id, owner_sub))
-        return cur.rowcount
+        conn.execute("DELETE FROM milk_records WHERE id = ?", (rec_id,))
 
-def get_all_rows(owner_sub: str):
+def get_all_rows():
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("""
           SELECT id, cow_number, litres, record_date, created_at
           FROM milk_records
-          WHERE owner_sub = ?
           ORDER BY record_date ASC, cow_number ASC, id ASC
-        """, (owner_sub,))
+        """)
         return cur.fetchall()
 
-def get_recent_rows(owner_sub: str, limit:int=100):
+def get_recent_rows(limit:int=100):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("""
           SELECT id, cow_number, litres, record_date, created_at
           FROM milk_records
-          WHERE owner_sub = ?
           ORDER BY id DESC
           LIMIT ?
-        """, (owner_sub, limit))
+        """, (limit,))
         return cur.fetchall()
 
-def get_last_n_dates(owner_sub: str, n:int):
+def get_last_n_dates(n:int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("""
           SELECT DISTINCT record_date
           FROM milk_records
-          WHERE owner_sub = ?
           ORDER BY record_date DESC
           LIMIT ?
-        """, (owner_sub, n))
+        """, (n,))
         dates = [r["record_date"] for r in cur.fetchall()]
-        return list(reversed(dates))  # oldest -> newest across columns
+        return list(reversed(dates))  # show oldest -> newest across columns
 
-def build_pivot_for_dates(owner_sub: str, dates):
+def build_pivot_for_dates(dates):
+    """
+    Return (dates, rows) where:
+      dates: ['YYYY-MM-DD', ...]
+      rows: [{'cow':'2146','cells':[12,17,...],'total':29}, ...]
+    """
     if not dates:
         return [], []
+
     placeholders = ",".join("?" for _ in dates)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        # owner_sub plus date placeholders
         cur = conn.execute(f"""
           SELECT cow_number, record_date, SUM(litres) AS litres
           FROM milk_records
-          WHERE owner_sub = ?
-            AND record_date IN ({placeholders})
+          WHERE record_date IN ({placeholders})
           GROUP BY cow_number, record_date
-        """, tuple([owner_sub] + dates))
+        """, tuple(dates))
         data = cur.fetchall()
 
+    # cow -> {date: litres}
     by_cow = {}
     for r in data:
         cow = r["cow_number"]
         by_cow.setdefault(cow, {})
         by_cow[cow][r["record_date"]] = float(r["litres"] or 0)
 
+    # numeric-ish sort of cows
     def cow_key(c):
-        try: return (0, int(c))
-        except: return (1, c)
+        try:
+            return (0, int(c))
+        except:
+            return (1, c)
 
     rows = []
     for cow in sorted(by_cow.keys(), key=cow_key):
@@ -169,106 +129,51 @@ def build_pivot_for_dates(owner_sub: str, dates):
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
     return dates, rows
 
-def claim_legacy_rows_for(owner_sub: str):
-    """Assign any legacy rows (NULL owner_sub) to this user once."""
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute("UPDATE milk_records SET owner_sub = ? WHERE owner_sub IS NULL", (owner_sub,))
-
-# Ensure DB exists / migrated at import time (important for Gunicorn/Render)
+# Ensure DB exists instantly on import (important on Render/Gunicorn)
 init_db()
 
-# ---------- Auth routes ----------
-@app.route("/login")
-def login():
-    if "google" not in oauth._clients:
-        return "Google OAuth not configured.", 500
-    session["post_login_redirect"] = request.args.get("next") or url_for("home")
-    return oauth.google.authorize_redirect(redirect_uri=OAUTH_REDIRECT_URI)
-
-@app.route("/auth/callback")
-def auth_callback():
-    if "google" not in oauth._clients:
-        return "Google OAuth not configured.", 500
-    token = oauth.google.authorize_access_token()
-    userinfo = token.get("userinfo") or oauth.google.parse_id_token(token)
-    if not userinfo or "sub" not in userinfo:
-        return "Login failed.", 400
-
-    session["user"] = {
-        "sub": userinfo["sub"],
-        "email": userinfo.get("email"),
-        "name": userinfo.get("name"),
-        "picture": userinfo.get("picture"),
-    }
-
-    # OPTIONAL: restrict to a domain
-    # email = session["user"].get("email", "")
-    # if not email.endswith("@yourfarm.ie"):
-    #     session.clear()
-    #     return "Unauthorized domain", 403
-
-    # Claim legacy rows so the user can see pre-existing data
-    try:
-        claim_legacy_rows_for(session["user"]["sub"])
-    except Exception:
-        pass
-
-    return redirect(session.pop("post_login_redirect", url_for("home")))
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("home"))
-
-# ---------- App routes ----------
+# ----------- Routes -----------
 @app.route("/")
 def home():
-    return render_template_string(TPL_HOME, base_css=BASE_CSS, user=session.get("user"))
+    return render_template_string(TPL_HOME, base_css=BASE_CSS)
 
 @app.route("/new")
-@login_required
 def new_record_screen():
-    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=date.today().isoformat(), user=session.get("user"))
+    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=date.today().isoformat())
 
 @app.route("/records")
-@login_required
 def records_screen():
     try:
         last = int(request.args.get("last", "7"))
     except ValueError:
         last = 7
     last = max(1, min(last, 90))
+
     prev_last = max(1, last - 3)
     next_last = min(90, last + 3)
 
-    owner = current_owner_sub()
-    dates = get_last_n_dates(owner, last)
-    dates, rows = build_pivot_for_dates(owner, dates)
+    dates = get_last_n_dates(last)
+    dates, rows = build_pivot_for_dates(dates)
     return render_template_string(
         TPL_RECORDS,
-        base_css=BASE_CSS, user=session.get("user"),
+        base_css=BASE_CSS,
         dates=dates, rows=rows, last=last,
         prev_last=prev_last, next_last=next_last
     )
 
 @app.route("/recent")
-@login_required
 def recent_screen():
     try:
         limit = int(request.args.get("limit", "100"))
     except ValueError:
         limit = 100
     limit = max(1, min(limit, 500))
-
-    owner = current_owner_sub()
-    rows = get_recent_rows(owner, limit)
+    rows = get_recent_rows(limit)
     msg = "Deleted 1 entry." if request.args.get("deleted") == "1" else None
-    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit, user=session.get("user"))
+    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit)
 
 @app.route("/add", methods=["POST"])
-@login_required
 def add():
-    owner = current_owner_sub()
     cow = request.form.get("cow_number", "").strip()
     litres = request.form.get("litres", "").strip()
     record_date_str = (request.form.get("record_date") or date.today().isoformat()).strip()
@@ -283,28 +188,24 @@ def add():
         return "Litres must be a non-negative number", 400
 
     try:
-        add_record(owner, cow, litres_val, record_date_str)
+        add_record(cow, litres_val, record_date_str)
     except ValueError:
         return "Bad date. Use YYYY-MM-DD.", 400
 
     return redirect(url_for("new_record_screen"))
 
 @app.route("/delete/<int:rec_id>", methods=["POST"])
-@login_required
 def delete(rec_id):
-    owner = current_owner_sub()
-    deleted = delete_record(owner, rec_id)
-    if deleted == 0:
-        abort(404)
+    delete_record(rec_id)
     return redirect(url_for("recent_screen", deleted=1))
 
 @app.route("/export.xlsx")
-@login_required
 def export_excel():
-    owner = current_owner_sub()
-    data = get_all_rows(owner)
+    data = get_all_rows()
+    from openpyxl import Workbook  # lazy import for speed
     wb = Workbook()
 
+    # Sheet 1: Raw data
     ws = wb.active
     ws.title = "Raw Records"
     ws.append(["ID", "Cow Number", "Litres", "Record Date", "Saved (UTC)"])
@@ -313,8 +214,9 @@ def export_excel():
     for col, w in zip("ABCDE", [8,12,10,12,25]):
         ws.column_dimensions[col].width = w
 
-    dates = get_last_n_dates(owner, 7)
-    dates, rows = build_pivot_for_dates(owner, dates)
+    # Sheet 2: Pivot (last 7 dates)
+    dates = get_last_n_dates(7)
+    dates, rows = build_pivot_for_dates(dates)
     ws2 = wb.create_sheet("Pivot (last 7 dates)")
     ws2.append(["Cow #", *dates, "Total"])
     for row in rows:
@@ -330,90 +232,105 @@ def export_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-@app.route("/backup.db")
-@login_required
-def backup_db():
-    if not BACKUP_TOKEN:
-        return "Not enabled", 404
-    if request.args.get("token") != BACKUP_TOKEN:
-        return "Forbidden", 403
-    return send_file(DB_PATH, as_attachment=True, download_name="milk_records.db")
-
 @app.route("/healthz")
 def healthz():
     return "ok", 200
 
-# ---------- Styles & Templates ----------
+# ----------- Styles & Templates -----------
 BASE_CSS = """
 :root{
-  --bg:#0b1220; --panel:#0f172a; --border:#1f2937; --text:#e5e7eb;
-  --muted:#94a3b8; --accent:#22c55e; --radius:18px; --shadow:0 10px 30px rgba(0,0,0,.35);
+  --bg:#0b1220; --panel:#0f172a; --border:#223044; --text:#e5e7eb;
+  --muted:#9aa5b1; --accent:#22c55e; --accent-fore:#07220e;
+  --radius:18px; --shadow:0 14px 40px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box}
-body{margin:0;background:linear-gradient(180deg,#08101d,#0f172a);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-.wrap{max-width:520px;margin:0 auto;padding:18px}
-.top{display:flex;align-items:center;justify-content:space-between;margin:10px 2px 16px}
-.title{font-weight:800;letter-spacing:.3px}
-.card{background:linear-gradient(180deg,#0b1220,#121a2e);border:1px solid var(--border);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+body{margin:0;background:radial-gradient(1200px 600px at 10% -10%, #0a1222 0, #0b1629 30%, #0f172a 70%), #0f172a;
+     color:var(--text);font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial}
+.wrap{max-width:680px;margin:0 auto;padding:22px}
+.top{display:flex;align-items:center;justify-content:space-between;margin:6px 2px 18px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:40px;height:40px}
+.title{font-weight:900;letter-spacing:.2px;font-size:22px}
+.kicker{color:var(--muted);font-size:12px;margin-top:-6px}
+.card{background:linear-gradient(180deg,#0c1324,#111a2f);border:1px solid var(--border);
+      border-radius:var(--radius);padding:18px 18px 16px;box-shadow:var(--shadow)}
 .menu{display:grid;gap:12px}
-.btn{display:flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:#05220f;font-weight:800;padding:14px 16px;border:none;border-radius:14px;cursor:pointer;text-decoration:none;text-align:center}
+.btn{display:flex;align-items:center;justify-content:center;gap:10px;background:var(--accent);color:var(--accent-fore);
+     font-weight:800;padding:14px 16px;border:none;border-radius:14px;cursor:pointer;text-decoration:none;text-align:center}
 .btn.secondary{background:#0b1220;color:var(--text);border:1px solid var(--border)}
 .btn.warn{background:#ef4444;color:#fff}
 .field{display:grid;gap:6px}
 label{font-size:13px;color:var(--muted)}
 input{background:#0b1220;border:1px solid var(--border);color:var(--text);padding:14px 12px;border-radius:12px;font-size:16px;width:100%}
 .grid2{display:grid;gap:12px;grid-template-columns:1fr}
-@media(min-width:420px){.grid2{grid-template-columns:1fr 1fr}}
+@media(min-width:520px){.grid2{grid-template-columns:1fr 1fr}}
 table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px;overflow-x:auto;display:block}
 thead, tbody { display: table; width: 100%; }
 th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 th{color:var(--muted);font-weight:600;background:#0b1220;position:sticky;top:0}
-tr:hover td{background:rgba(96,165,250,.06)}
-.hint{color:var(--muted);font-size:12px;text-align:center;margin-top:10px}
-.userbar{display:flex;gap:10px;align-items:center}
-.userbar img{width:28px;height:28px;border-radius:50%}
+tr:hover td{background:rgba(120,190,255,.06)}
+.hint{color:var(--muted);font-size:12px;text-align:center;margin-top:12px}
+.badge{display:inline-block;background:#0b1220;border:1px solid var(--border);color:var(--text);
+       border-radius:12px;padding:4px 10px;font-size:12px}
+.subtle{color:var(--muted);font-size:12px;text-align:center;margin-top:14px}
+.header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.hero{display:grid;grid-template-columns:1fr;gap:16px;margin-bottom:14px}
+.hero .stat{background:#0b1220;border:1px dashed #1b2a3e;border-radius:12px;padding:10px 12px;color:var(--muted);font-size:12px}
 """
 
+# Home – polished, simple, no login
 TPL_HOME = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Milk Log</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
-      <div class="title">Milk Log</div>
-      <div class="userbar">
-        {% if user %}
-          {% if user.picture %}<img src="{{ user.picture }}" alt="avatar">{% endif %}
-          <span>{{ user.email or user.name }}</span>
-          <a class="btn secondary" href="{{ url_for('logout') }}">Logout</a>
-        {% else %}
-          <a class="btn" href="{{ url_for('login') }}">Login with Google</a>
-        {% endif %}
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.7"/>
+          <circle cx="9" cy="11" r="1.6" fill="#22c55e"/><circle cx="15" cy="11" r="1.6" fill="#22c55e"/>
+        </svg>
+        <div>
+          <div class="title">Milk Log</div>
+          <div class="kicker">Fast, clean milk recording</div>
+        </div>
       </div>
+      <span class="badge">v1.0</span>
     </div>
+
     <div class="card">
-      <div style="font-size:18px;font-weight:700;margin-bottom:8px">First app menu</div>
+      <div class="hero">
+        <div class="stat">Tip: Add this to your phone’s Home Screen for a native feel.</div>
+      </div>
+      <div style="font-size:20px;font-weight:800;margin-bottom:10px">First app menu</div>
       <div class="menu">
         <a class="btn" href="{{ url_for('records_screen') }}">Cow Records</a>
         <a class="btn secondary" href="{{ url_for('new_record_screen') }}">New Recording</a>
         <a class="btn secondary" href="{{ url_for('recent_screen') }}">Recent Entries</a>
       </div>
     </div>
-    <div class="hint">Only logged-in users can add/view their records.</div>
+
+    <div class="subtle">Data is stored securely on the server (SQLite). Export anytime.</div>
   </div>
 </body></html>
 """
 
+# New Recording
 TPL_NEW = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>New Recording</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/>
+        </svg>
+        <div class="title">New Recording</div>
+      </div>
       <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
-      <div class="title">New Recording</div>
-      <a class="btn secondary" href="{{ url_for('logout') }}">Logout</a>
     </div>
+
     <div class="card">
       <form method="POST" action="{{ url_for('add') }}" autocomplete="off">
         <div class="grid2">
@@ -440,24 +357,29 @@ TPL_NEW = """
 </body></html>
 """
 
+# Cow Records (pivot)
 TPL_RECORDS = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cow Records</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
-      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
-      <div class="title">Cow Records</div>
-      <div style="display:flex;gap:8px;align-items:center">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/>
+        </svg>
+        <div class="title">Cow Records</div>
+      </div>
+      <div class="header-actions">
         <a class="btn secondary" href="{{ url_for('records_screen', last=prev_last) }}">-3d</a>
         <a class="btn secondary" href="{{ url_for('records_screen', last=next_last) }}">+3d</a>
         <a class="btn" href="{{ url_for('export_excel') }}">Export</a>
+        <a class="btn secondary" href="{{ url_for('new_record_screen') }}">Add</a>
       </div>
     </div>
+
     <div class="card">
-      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">
-        Showing last {{ last }} date{{ '' if last==1 else 's' }}.
-      </div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">Showing last {{ last }} date{{ '' if last==1 else 's' }}.</div>
       <table aria-label="Records by cow">
         <thead>
           <tr>
@@ -485,15 +407,20 @@ TPL_RECORDS = """
 </body></html>
 """
 
+# Recent Entries
 TPL_RECENT = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Recent Entries</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
     <div class="top">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/>
+        </svg>
+        <div class="title">Recent Entries</div>
+      </div>
       <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
-      <div class="title">Recent Entries</div>
-      <a class="btn secondary" href="{{ url_for('logout') }}">Logout</a>
     </div>
 
     {% if msg %}
@@ -541,6 +468,6 @@ TPL_RECENT = """
 </body></html>
 """
 
-# ---------- Local dev ----------
+# ----------- Local dev -----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
