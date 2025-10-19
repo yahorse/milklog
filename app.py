@@ -1,5 +1,5 @@
 # app.py
-# Milk Log v4 — Single-file Flask app with Authentication & Multi-tenant data isolation
+# Milk Log v4 - Single-file Flask app with Authentication & Multi-tenant data isolation
 # Adds:
 # - Users (email/password), login/logout/register (Flask-Login)
 # - Admin role (first user created becomes admin)
@@ -1208,7 +1208,11 @@ def manifest():
         "background_color": "#0f172a",
         "theme_color": "#22c55e",
         "icons": [
-            {"src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='192' height='192'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='55%' font-size='100' text-anchor='middle' fill='%2322c55e'>🐄</text></svg>", "sizes": "192x192", "type": "image/svg+xml"}
+            {
+                "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='192' height='192'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='55%' font-size='100' text-anchor='middle' fill='%2322c55e'>&#128004;</text></svg>",
+                "sizes": "192x192",
+                "type": "image/svg+xml",
+            }
         ]
     }
     return Response(json.dumps(data), mimetype="application/json")
@@ -1838,7 +1842,7 @@ TPL_TENANT_SETUP = """
         return;
       }
       if (!window.google || !google.accounts || !google.accounts.id) {
-        buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in…</div>';
+        buttonRegion.innerHTML = '<div class="hint">Loading Google sign-in...</div>';
         return;
       }
       google.accounts.id.initialize({
@@ -1953,6 +1957,7 @@ TPL_LOGIN = """
         return;
       }
       if (!window.google || !google.accounts || !google.accounts.id) {
+        buttonRegion.innerHTML = '<div class=\"hint\">Loading Google sign-in...</div>';
         buttonRegion.innerHTML = '<div class=\"hint\">Loading Google sign-in…</div>';
         setTimeout(renderGoogleButton, 400);
         return;
@@ -1995,6 +2000,7 @@ TPL_LOGIN = """
   </script>
 </body></html>
 
+"""
 
 TPL_REGISTER = """
 <!doctype html><html lang="en"><head>
@@ -2106,7 +2112,7 @@ TPL_HOME = """
       </div>
     </div>
 
-    <div class="subtle">Install to Home Screen for an app-like experience • Data is scoped to your login • Export anytime.</div>
+    <div class="subtle">Install to Home Screen for an app-like experience &bull; Data is scoped to your login &bull; Export anytime.</div>
   </div>
 </body></html>
 """
@@ -2226,7 +2232,7 @@ TPL_RECENT = """
             <td>{{ r.session }}</td>
             <td>{{ '%.2f'|format(r.litres) }}</td>
             <td>{% if r.price_per_litre is not none %}{{ '%.2f'|format(r.price_per_litre) }}{% else %}<span class="pill">No price</span>{% endif %}</td>
-            <td>{% if r.gain is not none %}{{ '%.2f'|format(r.gain) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td>{% if r.gain is not none %}{{ '%.2f'|format(r.gain) }}{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
             <td>
               <form method="POST" action="{{ url_for('update', rec_id=r.id) }}" class="stacked-form">
                 <div class="inline-actions">
