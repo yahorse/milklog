@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -10,15 +11,31 @@ class MilkLogAppTests(unittest.TestCase):
     def setUpClass(cls):
         cls._tmpdir = tempfile.TemporaryDirectory()
         os.environ["DATA_DIR"] = cls._tmpdir.name
+        cls.admin_email = "admin@example.com"
+        cls.admin_token = "mock-token-admin"
+        cls.tenant_slug = "dairy-one"
+        os.environ["TENANT_SETTINGS"] = json.dumps(
+            [
+                {
+                    "slug": cls.tenant_slug,
+                    "name": "Dairy One",
+                    "google_client_id": "test-client-id",
+                    "mock_users": [
+                        {"email": cls.admin_email, "credential": cls.admin_token}
+                    ],
+                }
+            ]
+        )
         sys.modules.pop("app", None)
         cls.app_module = importlib.import_module("app")
         cls.app_module.app.config["TESTING"] = True
-        cls.admin_email = "admin@example.com"
-        cls.admin_password = "Password123!"
         with cls.app_module.app.test_client() as client:
             client.post(
-                "/register",
-                data={"email": cls.admin_email, "password": cls.admin_password},
+                "/login",
+                data={
+                    "tenant": cls.tenant_slug,
+                    "credential": cls.admin_token,
+                },
                 follow_redirects=True,
             )
             client.post(
@@ -41,7 +58,10 @@ class MilkLogAppTests(unittest.TestCase):
         self.client = self.app_module.app.test_client()
         response = self.client.post(
             "/login",
-            data={"email": self.admin_email, "password": self.admin_password},
+            data={
+                "tenant": self.tenant_slug,
+                "credential": self.admin_token,
+            },
             follow_redirects=True,
         )
         self.assertEqual(response.status_code, 200)
@@ -76,6 +96,39 @@ class MilkLogAppTests(unittest.TestCase):
             with self.subTest(url=url):
                 response = self.client.get(url)
                 self.assertEqual(response.status_code, 200)
+
+    def test_can_setup_new_tenant_with_mock_credential(self):
+        self.client.get("/logout", follow_redirects=True)
+        new_slug = "fresh-dairy"
+        new_email = "owner@example.com"
+        new_token = "mock-new-token"
+
+        create = self.client.post(
+            "/tenant/setup",
+            data={
+                "name": "Fresh Dairy",
+                "slug": new_slug,
+                "google_client_id": "test-client-id",
+                "credential": new_token,
+                "mock_email": new_email,
+                "mock_credential": new_token,
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(create.status_code, 200)
+        self.assertIn("Milk Log", create.get_data(as_text=True))
+
+        self.client.get("/logout", follow_redirects=True)
+        login_resp = self.client.post(
+            "/login",
+            data={
+                "tenant": new_slug,
+                "credential": new_token,
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(login_resp.status_code, 200)
+        self.assertIn("Milk Log", login_resp.get_data(as_text=True))
 
     def test_add_record_flow(self):
         resp = self.client.post(
