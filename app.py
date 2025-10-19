@@ -491,12 +491,52 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-const CACHE="milklog-v43-google";
-const ASSETS=["/","/new","/records","/recent","/import","/export.csv","/manifest.json","/login","/register"];
-self.addEventListener("install",e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS))));
-self.addEventListener("fetch",e=>{e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request).then(x=>{const y=x.clone();caches.open(CACHE).then(c=>c.put(e.request,y));return x;})));});
+const CACHE = "milklog-v44-static-only";
+const STATIC_ASSETS = [
+  "/manifest.json"
+];
+
+// Install: pre-cache just static assets
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll(STATIC_ASSETS))
+  );
+});
+
+// Activate: clean old caches
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.map(k => (k === CACHE ? null : caches.delete(k))))
+    )
+  );
+});
+
+// Fetch: only GET requests to STATIC_ASSETS are cached.
+// Never cache HTML pages or POST/PUT/PATCH/DELETE.
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+
+  const url = new URL(req.url);
+  const isStatic = STATIC_ASSETS.includes(url.pathname);
+
+  if (!isStatic) return; // Let the network handle dynamic pages with CSRF tokens
+
+  event.respondWith(
+    caches.match(req).then((cached) => {
+      if (cached) return cached;
+      return fetch(req).then((res) => {
+        const resClone = res.clone();
+        caches.open(CACHE).then((cache) => cache.put(req, resClone));
+        return res;
+      });
+    })
+  );
+});
 """
     return Response(js, mimetype="application/javascript")
+
 
 # -------- Views --------
 @app.route("/")
