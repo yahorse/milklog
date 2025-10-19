@@ -99,102 +99,119 @@ def init_db():
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
 
-    # users (auth + finance + google fields)
-conn.execute("""
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('admin','user')),
-  created_at TEXT NOT NULL,
-  unit_pref TEXT DEFAULT 'L',
-  milk_price_per_litre REAL DEFAULT 0.0,
-  currency TEXT DEFAULT '€',
-  google_sub TEXT,             -- no UNIQUE here; enforce via index
-  name TEXT,
-  avatar TEXT
-)""")
+        # ---------- users ----------
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin','user')),
+            created_at TEXT NOT NULL,
+            unit_pref TEXT DEFAULT 'L',
+            milk_price_per_litre REAL DEFAULT 0.0,
+            currency TEXT DEFAULT '€',
+            google_sub TEXT,
+            name TEXT,
+            avatar TEXT
+        )
+        """)
 
-ucols = columns(conn, "users")
-if "unit_pref" not in ucols:
-    conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT DEFAULT 'L'")
-if "milk_price_per_litre" not in ucols:
-    conn.execute("ALTER TABLE users ADD COLUMN milk_price_per_litre REAL DEFAULT 0.0")
-if "currency" not in ucols:
-    conn.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '€'")
-if "google_sub" not in ucols:
-    # IMPORTANT: add without UNIQUE; uniqueness is enforced by an index below
-    conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
-if "name" not in ucols:
-    conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
-if "avatar" not in ucols:
-    conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+        ucols = columns(conn, "users")
+        if "unit_pref" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT DEFAULT 'L'")
+        if "milk_price_per_litre" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN milk_price_per_litre REAL DEFAULT 0.0")
+        if "currency" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '€'")
+        if "google_sub" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+        if "name" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
+        if "avatar" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
 
-# Uniqueness: email is already unique; make google_sub unique via an index
-conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
-conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
+        # unique indexes
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
 
-
-        # milk_records
+        # ---------- milk_records ----------
         conn.execute("""
         CREATE TABLE IF NOT EXISTS milk_records (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          cow_number TEXT NOT NULL,
-          litres REAL NOT NULL CHECK(litres >= 0),
-          record_date TEXT NOT NULL,
-          session TEXT DEFAULT 'AM' CHECK(session IN ('AM','PM')),
-          note TEXT,
-          tags TEXT,
-          deleted INTEGER DEFAULT 0 CHECK(deleted IN (0,1)),
-          owner_id INTEGER,
-          created_at TEXT NOT NULL,
-          edited_at TEXT,
-          FOREIGN KEY(owner_id) REFERENCES users(id)
-        )""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cow_number TEXT NOT NULL,
+            litres REAL NOT NULL CHECK(litres >= 0),
+            record_date TEXT NOT NULL,
+            session TEXT DEFAULT 'AM' CHECK(session IN ('AM','PM')),
+            note TEXT,
+            tags TEXT,
+            deleted INTEGER DEFAULT 0 CHECK(deleted IN (0,1)),
+            owner_id INTEGER,
+            created_at TEXT NOT NULL,
+            edited_at TEXT,
+            FOREIGN KEY(owner_id) REFERENCES users(id)
+        )
+        """)
+
         mcols = columns(conn, "milk_records")
-        if "session"   not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
-        if "note"      not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
-        if "tags"      not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
-        if "deleted"   not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
-        if "owner_id"  not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN owner_id INTEGER")
-        if "edited_at" not in mcols: conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
+        if "session" not in mcols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
+        if "note" not in mcols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
+        if "tags" not in mcols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
+        if "deleted" not in mcols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
+        if "owner_id" not in mcols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN owner_id INTEGER")
+        if "edited_at" not in mcols:
+            conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_date ON milk_records(record_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_cow  ON milk_records(cow_number)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_sess ON milk_records(session)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_del  ON milk_records(deleted)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_cow ON milk_records(cow_number)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_owner ON milk_records(owner_id)")
 
-        # cows (kept for compatibility)
+        # ---------- cows ----------
         conn.execute("""
         CREATE TABLE IF NOT EXISTS cows (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          tag TEXT UNIQUE NOT NULL,
-          name TEXT,
-          breed TEXT,
-          parity INTEGER,
-          dob TEXT,
-          latest_calving TEXT,
-          group_name TEXT,
-          owner_id INTEGER,
-          created_at TEXT,
-          edited_at TEXT,
-          FOREIGN KEY(owner_id) REFERENCES users(id)
-        )""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag TEXT UNIQUE NOT NULL,
+            name TEXT,
+            breed TEXT,
+            parity INTEGER,
+            dob TEXT,
+            latest_calving TEXT,
+            group_name TEXT,
+            owner_id INTEGER,
+            created_at TEXT,
+            edited_at TEXT,
+            FOREIGN KEY(owner_id) REFERENCES users(id)
+        )
+        """)
+
         ccols = columns(conn, "cows")
-        if "name"           not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN name TEXT")
-        if "breed"          not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN breed TEXT")
-        if "parity"         not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN parity INTEGER")
-        if "dob"            not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN dob TEXT")
-        if "latest_calving" not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN latest_calving TEXT")
-        if "group_name"     not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN group_name TEXT")
-        if "owner_id"       not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN owner_id INTEGER")
-        if "created_at"     not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN created_at TEXT")
-        if "edited_at"      not in ccols: conn.execute("ALTER TABLE cows ADD COLUMN edited_at TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_tag   ON cows(tag)")
+        if "name" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN name TEXT")
+        if "breed" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN breed TEXT")
+        if "parity" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN parity INTEGER")
+        if "dob" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN dob TEXT")
+        if "latest_calving" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN latest_calving TEXT")
+        if "group_name" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN group_name TEXT")
+        if "owner_id" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN owner_id INTEGER")
+        if "created_at" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN created_at TEXT")
+        if "edited_at" not in ccols:
+            conn.execute("ALTER TABLE cows ADD COLUMN edited_at TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_tag ON cows(tag)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_group ON cows(group_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_owner ON cows(owner_id)")
 
-init_db()
 
 # -------- Utilities --------
 def today_str():
