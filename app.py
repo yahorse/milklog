@@ -1,93 +1,133 @@
 # app.py
-# Milk Log – Flask app for Render with persistent SQLite
-# - Enter Cow Number, Litres, Date (YYYY-MM-DD)
-# - Records view: dynamic columns by date (same cow+date sums)
-# - Recent Entries with Delete
-# - Export to Excel (raw + pivot)
-# - WAL mode; DB created at import time so Gunicorn on Render works
+# Milk Log – Flask app with Google Login (Authlib) and per-user data
+# - Google OAuth login/logout
+# - Each record is owned by the logged-in Google account (sub)
+# - Render-ready (persistent SQLite, WAL), delete, pivot, export, backup
 
 import os
 import io
 import sqlite3
 from contextlib import closing
 from datetime import datetime, date
-from flask import Flask, request, redirect, url_for, render_template_string, send_file
+
+from flask import (
+    Flask, request, redirect, url_for, render_template_string,
+    send_file, session, abort
+)
 from openpyxl import Workbook
+from authlib.integrations.flask_client import OAuth
+from functools import wraps
 
 app = Flask(__name__)
 
-# ---------- Persistence (Render) ----------
+# ---------- Config & Persistence ----------
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-please-change")
 DATA_DIR = os.getenv("DATA_DIR", "/var/data")
 if not os.path.isdir(DATA_DIR):
-    # Fallback to local dir if disk not mounted; also ensure dir exists
     DATA_DIR = "."
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
-BACKUP_TOKEN = os.getenv("BACKUP_TOKEN")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
+
+# ---------- OAuth (Google) ----------
+oauth = OAuth(app)
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    oauth.register(
+        name="google",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={
+            "scope": "openid email profile"
+        },
+    )
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+def current_owner_sub() -> str:
+    # unique Google account identifier
+    u = session.get("user")
+    return u["sub"] if u else None
 
 # ---------- DB helpers ----------
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        # Main table + owner_sub for per-user isolation
         conn.execute("""
           CREATE TABLE IF NOT EXISTS milk_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_sub TEXT NOT NULL,
             cow_number TEXT NOT NULL,
             litres REAL NOT NULL CHECK(litres >= 0),
             record_date TEXT NOT NULL,        -- YYYY-MM-DD
             created_at TEXT NOT NULL          -- ISO (UTC)
           )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_date ON milk_records(owner_sub, record_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_cow ON milk_records(owner_sub, cow_number)")
 
-def add_record(cow_number: str, litres: float, record_date_str: str):
-    # validate date format
+def add_record(owner_sub: str, cow_number: str, litres: float, record_date_str: str):
     _ = date.fromisoformat(record_date_str)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
-          INSERT INTO milk_records (cow_number, litres, record_date, created_at)
-          VALUES (?, ?, ?, ?)
-        """, (cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()))
+          INSERT INTO milk_records (owner_sub, cow_number, litres, record_date, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        """, (owner_sub, cow_number.strip(), float(litres), record_date_str, datetime.utcnow().isoformat()))
 
-def delete_record(rec_id: int):
+def delete_record(owner_sub: str, rec_id: int) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute("DELETE FROM milk_records WHERE id = ?", (rec_id,))
+        cur = conn.execute("DELETE FROM milk_records WHERE id = ? AND owner_sub = ?", (rec_id, owner_sub))
+        return cur.rowcount
 
-def get_all_rows():
+def get_all_rows(owner_sub: str):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("""
           SELECT id, cow_number, litres, record_date, created_at
           FROM milk_records
+          WHERE owner_sub = ?
           ORDER BY record_date ASC, cow_number ASC, id ASC
-        """)
+        """, (owner_sub,))
         return cur.fetchall()
 
-def get_recent_rows(limit:int=100):
+def get_recent_rows(owner_sub: str, limit:int=100):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("""
           SELECT id, cow_number, litres, record_date, created_at
           FROM milk_records
+          WHERE owner_sub = ?
           ORDER BY id DESC
           LIMIT ?
-        """, (limit,))
+        """, (owner_sub, limit))
         return cur.fetchall()
 
-def get_last_n_dates(n:int):
+def get_last_n_dates(owner_sub: str, n:int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute("""
           SELECT DISTINCT record_date
           FROM milk_records
+          WHERE owner_sub = ?
           ORDER BY record_date DESC
           LIMIT ?
-        """, (n,))
+        """, (owner_sub, n))
         dates = [r["record_date"] for r in cur.fetchall()]
-        return list(reversed(dates))  # left-to-right oldest -> newest
+        return list(reversed(dates))
 
-def build_pivot_for_dates(dates):
+def build_pivot_for_dates(owner_sub: str, dates):
     if not dates:
         return [], []
     placeholders = ",".join("?" for _ in dates)
@@ -96,9 +136,10 @@ def build_pivot_for_dates(dates):
         cur = conn.execute(f"""
           SELECT cow_number, record_date, SUM(litres) AS litres
           FROM milk_records
-          WHERE record_date IN ({placeholders})
+          WHERE owner_sub = ?
+            AND record_date IN ({placeholders})
           GROUP BY cow_number, record_date
-        """, tuple(dates))
+        """, tuple([owner_sub] + dates))
         data = cur.fetchall()
 
     by_cow = {}
@@ -108,10 +149,8 @@ def build_pivot_for_dates(dates):
         by_cow[cow][r["record_date"]] = float(r["litres"] or 0)
 
     def cow_key(c):
-        try:
-            return (0, int(c))
-        except:
-            return (1, c)
+        try: return (0, int(c))
+        except: return (1, c)
 
     rows = []
     for cow in sorted(by_cow.keys(), key=cow_key):
@@ -119,19 +158,55 @@ def build_pivot_for_dates(dates):
         rows.append({"cow": cow, "cells": cells, "total": round(sum(cells), 2)})
     return dates, rows
 
-# --- Ensure DB is ready at import time (important for Gunicorn/Render) ---
+# Make sure DB exists (important for Gunicorn on Render)
 init_db()
 
-# ---------- Routes ----------
+# ---------- Auth routes ----------
+@app.route("/login")
+def login():
+    if "google" not in oauth._clients:
+        return "Google OAuth not configured.", 500
+    next_url = request.args.get("next") or url_for("home")
+    session["post_login_redirect"] = next_url
+    return oauth.google.authorize_redirect(redirect_uri=OAUTH_REDIRECT_URI)
+
+@app.route("/auth/callback")
+def auth_callback():
+    if "google" not in oauth._clients:
+        return "Google OAuth not configured.", 500
+    token = oauth.google.authorize_access_token()
+    userinfo = token.get("userinfo")
+    if not userinfo:
+        # Some providers return userinfo via separate endpoint:
+        userinfo = oauth.google.parse_id_token(token)
+    if not userinfo or "sub" not in userinfo:
+        return "Login failed.", 400
+    # Store only what's needed
+    session["user"] = {
+        "sub": userinfo["sub"],
+        "email": userinfo.get("email"),
+        "name": userinfo.get("name"),
+        "picture": userinfo.get("picture"),
+    }
+    return redirect(session.pop("post_login_redirect", url_for("home")))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("home"))
+
+# ---------- App routes ----------
 @app.route("/")
 def home():
-    return render_template_string(TPL_HOME, base_css=BASE_CSS)
+    return render_template_string(TPL_HOME, base_css=BASE_CSS, user=session.get("user"))
 
 @app.route("/new")
+@login_required
 def new_record_screen():
-    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=date.today().isoformat())
+    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=date.today().isoformat(), user=session.get("user"))
 
 @app.route("/records")
+@login_required
 def records_screen():
     try:
         last = int(request.args.get("last", "7"))
@@ -141,28 +216,34 @@ def records_screen():
     prev_last = max(1, last - 3)
     next_last = min(90, last + 3)
 
-    dates = get_last_n_dates(last)
-    dates, rows = build_pivot_for_dates(dates)
+    owner = current_owner_sub()
+    dates = get_last_n_dates(owner, last)
+    dates, rows = build_pivot_for_dates(owner, dates)
     return render_template_string(
         TPL_RECORDS,
-        base_css=BASE_CSS,
+        base_css=BASE_CSS, user=session.get("user"),
         dates=dates, rows=rows, last=last,
         prev_last=prev_last, next_last=next_last
     )
 
 @app.route("/recent")
+@login_required
 def recent_screen():
     try:
         limit = int(request.args.get("limit", "100"))
     except ValueError:
         limit = 100
     limit = max(1, min(limit, 500))
-    rows = get_recent_rows(limit)
+
+    owner = current_owner_sub()
+    rows = get_recent_rows(owner, limit)
     msg = "Deleted 1 entry." if request.args.get("deleted") == "1" else None
-    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit)
+    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, msg=msg, limit=limit, user=session.get("user"))
 
 @app.route("/add", methods=["POST"])
+@login_required
 def add():
+    owner = current_owner_sub()
     cow = request.form.get("cow_number", "").strip()
     litres = request.form.get("litres", "").strip()
     record_date_str = (request.form.get("record_date") or date.today().isoformat()).strip()
@@ -177,24 +258,26 @@ def add():
         return "Litres must be a non-negative number", 400
 
     try:
-        add_record(cow, litres_val, record_date_str)
+        add_record(owner, cow, litres_val, record_date_str)
     except ValueError:
         return "Bad date. Use YYYY-MM-DD.", 400
-    except sqlite3.OperationalError as e:
-        # If table somehow missing, re-init and ask user to retry
-        init_db()
-        return "Database was initialising. Please try again.", 503
 
     return redirect(url_for("new_record_screen"))
 
 @app.route("/delete/<int:rec_id>", methods=["POST"])
+@login_required
 def delete(rec_id):
-    delete_record(rec_id)
+    owner = current_owner_sub()
+    deleted = delete_record(owner, rec_id)
+    if deleted == 0:
+        abort(404)
     return redirect(url_for("recent_screen", deleted=1))
 
 @app.route("/export.xlsx")
+@login_required
 def export_excel():
-    data = get_all_rows()
+    owner = current_owner_sub()
+    data = get_all_rows(owner)
     wb = Workbook()
 
     ws = wb.active
@@ -205,8 +288,8 @@ def export_excel():
     for col, w in zip("ABCDE", [8,12,10,12,25]):
         ws.column_dimensions[col].width = w
 
-    dates = get_last_n_dates(7)
-    dates, rows = build_pivot_for_dates(dates)
+    dates = get_last_n_dates(owner, 7)
+    dates, rows = build_pivot_for_dates(owner, dates)
     ws2 = wb.create_sheet("Pivot (last 7 dates)")
     ws2.append(["Cow #", *dates, "Total"])
     for row in rows:
@@ -222,11 +305,14 @@ def export_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+# Optional protected backup (per-user DB not needed; this backs up whole DB)
 @app.route("/backup.db")
+@login_required
 def backup_db():
-    if not BACKUP_TOKEN:
+    token = os.getenv("BACKUP_TOKEN")
+    if not token:
         return "Not enabled", 404
-    if request.args.get("token") != BACKUP_TOKEN:
+    if request.args.get("token") != token:
         return "Forbidden", 403
     return send_file(DB_PATH, as_attachment=True, download_name="milk_records.db")
 
@@ -261,23 +347,37 @@ th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);whi
 th{color:var(--muted);font-weight:600;background:#0b1220;position:sticky;top:0}
 tr:hover td{background:rgba(96,165,250,.06)}
 .hint{color:var(--muted);font-size:12px;text-align:center;margin-top:10px}
+.userbar{display:flex;gap:10px;align-items:center}
+.userbar img{width:28px;height:28px;border-radius:50%}
 """
 
+# Note: we pass `user` into templates; show login/logout + who’s logged in.
 TPL_HOME = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Milk Log</title><style>{{ base_css }}</style></head><body>
   <div class="wrap">
-    <div class="top"><div class="title">Milk Log</div></div>
+    <div class="top">
+      <div class="title">Milk Log</div>
+      <div class="userbar">
+        {% if user %}
+          {% if user.picture %}<img src="{{ user.picture }}" alt="avatar">{% endif %}
+          <span>{{ user.email or user.name }}</span>
+          <a class="btn secondary" href="{{ url_for('logout') }}">Logout</a>
+        {% else %}
+          <a class="btn" href="{{ url_for('login') }}">Login with Google</a>
+        {% endif %}
+      </div>
+    </div>
     <div class="card">
-      <div style="font-size:18px;font-weight:700;margin-bottom:8px">Cow Milk Logger</div>
+      <div style="font-size:18px;font-weight:700;margin-bottom:8px">First app menu</div>
       <div class="menu">
         <a class="btn" href="{{ url_for('records_screen') }}">Cow Records</a>
         <a class="btn secondary" href="{{ url_for('new_record_screen') }}">New Recording</a>
         <a class="btn secondary" href="{{ url_for('recent_screen') }}">Recent Entries</a>
       </div>
     </div>
-    <div class="hint">Tip: Add this page to your phone’s home screen.</div>
+    <div class="hint">Only logged-in users can add/view their records.</div>
   </div>
 </body></html>
 """
@@ -290,7 +390,7 @@ TPL_NEW = """
     <div class="top">
       <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
       <div class="title">New Recording</div>
-      <span></span>
+      <a class="btn secondary" href="{{ url_for('logout') }}">Logout</a>
     </div>
     <div class="card">
       <form method="POST" action="{{ url_for('add') }}" autocomplete="off">
@@ -371,7 +471,7 @@ TPL_RECENT = """
     <div class="top">
       <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
       <div class="title">Recent Entries</div>
-      <span></span>
+      <a class="btn secondary" href="{{ url_for('logout') }}">Logout</a>
     </div>
 
     {% if msg %}
@@ -419,7 +519,6 @@ TPL_RECENT = """
 </body></html>
 """
 
-# ---------- Local run ----------
+# ---------- Local dev ----------
 if __name__ == "__main__":
-    # For local dev; on Render, Gunicorn will import this file and the init_db already ran.
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
