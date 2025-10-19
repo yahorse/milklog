@@ -42,41 +42,112 @@ DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
 
 # ---------- DB init & helpers ----------
 def init_db():
-    """Create/upgrade schema safely; idempotent migrations."""
+    """Create/upgrade schema safely; idempotent migrations for old DBs."""
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
 
-        # Milk records base
+        # --- milk_records (base create + backfill columns) ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS milk_records (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           cow_number TEXT NOT NULL,
           litres REAL NOT NULL CHECK(litres >= 0),
-          record_date TEXT NOT NULL,       -- YYYY-MM-DD
+          record_date TEXT NOT NULL,
           session TEXT DEFAULT 'AM' CHECK(session IN ('AM','PM')),
           note TEXT,
-          tags TEXT,                       -- csv tags e.g. "fresh,mastitis"
+          tags TEXT,
           deleted INTEGER DEFAULT 0 CHECK(deleted IN (0,1)),
           created_at TEXT NOT NULL,
           edited_at TEXT
         )""")
-        # Legacy migrations
+
         cols = [r[1] for r in conn.execute("PRAGMA table_info(milk_records)").fetchall()]
-        if "session" not in cols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
-        if "note" not in cols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
-        if "tags" not in cols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
-        if "deleted" not in cols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
-        if "edited_at" not in cols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
+        if "session"   not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
+        if "note"      not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
+        if "tags"      not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
+        if "deleted"   not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
+        if "edited_at" not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_date ON milk_records(record_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_cow  ON milk_records(cow_number)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_sess ON milk_records(session)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_del  ON milk_records(deleted)")
+
+        # --- cows (base create + backfill columns) ---
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS cows (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          tag TEXT UNIQUE NOT NULL,
+          name TEXT,
+          breed TEXT,
+          parity INTEGER,
+          dob TEXT,
+          latest_calving TEXT,
+          group_name TEXT,
+          created_at TEXT,
+          edited_at TEXT
+        )""")
+
+        cows_cols = [r[1] for r in conn.execute("PRAGMA table_info(cows)").fetchall()]
+        # add any missing columns from older schemas
+        if "name"           not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN name TEXT")
+        if "breed"          not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN breed TEXT")
+        if "parity"         not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN parity INTEGER")
+        if "dob"            not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN dob TEXT")
+        if "latest_calving" not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN latest_calving TEXT")
+        if "group_name"     not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN group_name TEXT")
+        if "created_at"     not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN created_at TEXT")
+        if "edited_at"      not in cows_cols: conn.execute("ALTER TABLE cows ADD COLUMN edited_at TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_tag   ON cows(tag)")
+        # this index must be created AFTER ensuring the column exists
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_group ON cows(group_name)")
+
+        # --- health_events (base create + backfill) ---
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS health_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          cow_tag TEXT NOT NULL,
+          event_date TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          details TEXT,
+          withdrawal_until TEXT,
+          protocol TEXT,
+          created_at TEXT NOT NULL,
+          edited_at TEXT
+        )""")
+
+        h_cols = [r[1] for r in conn.execute("PRAGMA table_info(health_events)").fetchall()]
+        if "details"          not in h_cols: conn.execute("ALTER TABLE health_events ADD COLUMN details TEXT")
+        if "withdrawal_until" not in h_cols: conn.execute("ALTER TABLE health_events ADD COLUMN withdrawal_until TEXT")
+        if "protocol"         not in h_cols: conn.execute("ALTER TABLE health_events ADD COLUMN protocol TEXT")
+        if "created_at"       not in h_cols: conn.execute("ALTER TABLE health_events ADD COLUMN created_at TEXT")
+        if "edited_at"        not in h_cols: conn.execute("ALTER TABLE health_events ADD COLUMN edited_at TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_health_cowdate ON health_events(cow_tag, event_date)")
+
+        # --- breeding_events (base create + backfill) ---
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS breeding_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          cow_tag TEXT NOT NULL,
+          event_date TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          sire TEXT,
+          details TEXT,
+          created_at TEXT NOT NULL,
+          edited_at TEXT
+        )""")
+
+        b_cols = [r[1] for r in conn.execute("PRAGMA table_info(breeding_events)").fetchall()]
+        if "sire"       not in b_cols: conn.execute("ALTER TABLE breeding_events ADD COLUMN sire TEXT")
+        if "details"    not in b_cols: conn.execute("ALTER TABLE breeding_events ADD COLUMN details TEXT")
+        if "created_at" not in b_cols: conn.execute("ALTER TABLE breeding_events ADD COLUMN created_at TEXT")
+        if "edited_at"  not in b_cols: conn.execute("ALTER TABLE breeding_events ADD COLUMN edited_at TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_breed_cowdate ON breeding_events(cow_tag, event_date)")
+
 
         # Cows registry
         conn.execute("""
