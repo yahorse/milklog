@@ -36,6 +36,8 @@ class MilkLogAppTests(unittest.TestCase):
                 data={
                     "tenant": cls.tenant_slug,
                     "credential": cls.admin_token,
+                    "email": cls.admin_email,
+                    "mock_credential": cls.admin_token,
                 },
                 follow_redirects=True,
             )
@@ -62,6 +64,8 @@ class MilkLogAppTests(unittest.TestCase):
             data={
                 "tenant": self.tenant_slug,
                 "credential": self.admin_token,
+                "email": self.admin_email,
+                "mock_credential": self.admin_token,
             },
             follow_redirects=True,
         )
@@ -111,6 +115,14 @@ class MilkLogAppTests(unittest.TestCase):
                 "workspace_name": "Fresh Dairy",
                 "credential": new_token,
                 "email_hint": new_email,
+            "/tenant/setup",
+            data={
+                "name": "Fresh Dairy",
+                "slug": new_slug,
+                "google_client_id": "test-client-id",
+                "credential": new_token,
+                "mock_email": new_email,
+                "mock_credential": new_token,
             },
             follow_redirects=True,
         )
