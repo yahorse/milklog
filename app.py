@@ -121,6 +121,7 @@ def init_db():
           session TEXT DEFAULT 'AM' CHECK(session IN ('AM','PM')),
           note TEXT,
           tags TEXT,
+          price_per_litre REAL CHECK(price_per_litre IS NULL OR price_per_litre >= 0),
           deleted INTEGER DEFAULT 0 CHECK(deleted IN (0,1)),
           owner_id INTEGER,
           created_at TEXT NOT NULL,
@@ -131,6 +132,10 @@ def init_db():
         if "session"   not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
         if "note"      not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
         if "tags"      not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
+        if "price_per_litre" not in cols:
+            conn.execute(
+                "ALTER TABLE milk_records ADD COLUMN price_per_litre REAL CHECK(price_per_litre IS NULL OR price_per_litre >= 0)"
+            )
         if "deleted"   not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
         if "owner_id"  not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN owner_id INTEGER")
         if "edited_at" not in cols: conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
@@ -236,6 +241,12 @@ def kpis_for_home(owner_id):
         WHERE deleted=0 AND record_date=? AND owner_id=?
     """, (t, owner_id))
     tot = float(row[0]["tot"]) if row else 0.0
+    gain_row = query("""
+        SELECT COALESCE(SUM(litres * COALESCE(price_per_litre,0)),0) AS gain
+        FROM milk_records
+        WHERE deleted=0 AND record_date=? AND owner_id=?
+    """, (t, owner_id))
+    total_gain = float(gain_row[0]["gain"] or 0) if gain_row else 0.0
     cows = query("""
         SELECT COUNT(DISTINCT cow_number) AS n
         FROM milk_records
@@ -255,7 +266,16 @@ def kpis_for_home(owner_id):
     am_n = int(am[0]["n"]) if am else 0
     pm_n = int(pm[0]["n"]) if pm else 0
     milk_per_cow = round(tot / n_cows, 2) if n_cows else 0.0
-    return {"tot_litres": round(tot,2), "cows_recorded": n_cows, "milk_per_cow": milk_per_cow, "am_coverage": am_n, "pm_coverage": pm_n}
+    avg_gain = round(total_gain / n_cows, 2) if n_cows else 0.0
+    return {
+        "tot_litres": round(tot,2),
+        "cows_recorded": n_cows,
+        "milk_per_cow": milk_per_cow,
+        "am_coverage": am_n,
+        "pm_coverage": pm_n,
+        "avg_gain": avg_gain,
+        "total_gain": round(total_gain, 2)
+    }
 
 def alerts_compute(owner_id):
     t = today_str()
@@ -373,17 +393,22 @@ def admin_claim(table):
     return redirect(url_for("admin_home"))
 
 # ---------- App features (now per-user scoped) ----------
-def add_record(cow_number, litres, record_date_str, session_val, note, tags, owner_id):
+def add_record(cow_number, litres, record_date_str, session_val, note, tags, owner_id, price_per_litre=None):
     _ = date.fromisoformat(record_date_str)
     if session_val not in ("AM","PM"):
         session_val = "AM"
+    price_value = None
+    if price_per_litre not in (None, ""):
+        price_value = float(price_per_litre)
+        if price_value < 0:
+            raise ValueError("price_per_litre must be non-negative")
     exec_write("""
-      INSERT INTO milk_records (cow_number, litres, record_date, session, note, tags, owner_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO milk_records (cow_number, litres, record_date, session, note, tags, price_per_litre, owner_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (cow_number.strip(), float(litres), record_date_str, session_val, note.strip() or None,
-          tags.strip() or None, owner_id, datetime.utcnow().isoformat()))
+          tags.strip() or None, price_value, owner_id, datetime.utcnow().isoformat()))
 
-def update_record(rec_id, litres, session_val, note, tags, owner_id):
+def update_record(rec_id, litres, session_val, note, tags, owner_id, price_per_litre=None):
     fields = []
     args = []
     if litres is not None:
@@ -392,6 +417,11 @@ def update_record(rec_id, litres, session_val, note, tags, owner_id):
         fields.append("session=?"); args.append(session_val if session_val in ("AM","PM") else "AM")
     fields.append("note=?"); args.append(note.strip() or None)
     fields.append("tags=?"); args.append((tags.strip() or None))
+    if price_per_litre is not None:
+        price_val = float(price_per_litre)
+        if price_val < 0:
+            raise ValueError("price_per_litre must be non-negative")
+        fields.append("price_per_litre=?"); args.append(price_val)
     fields.append("edited_at=?"); args.append(datetime.utcnow().isoformat())
     args.extend([owner_id, rec_id])
     exec_write(f"UPDATE milk_records SET {', '.join(fields)} WHERE owner_id=? AND id=?", tuple(args))
@@ -457,6 +487,7 @@ def add():
     session_val = (request.form.get("session") or "AM").strip()
     note = (request.form.get("note") or "").strip()
     tags = (request.form.get("tags") or "").strip()
+    price_raw = (request.form.get("price_per_litre") or "").strip()
     record_date_str = (request.form.get("record_date") or today_str()).strip()
     if not cow:
         flash("Cow number is required", "error")
@@ -468,7 +499,16 @@ def add():
         flash("Litres must be a non-negative number", "error")
         return redirect(url_for("new_record_screen"))
     try:
-        add_record(cow, litres_val, record_date_str, session_val, note, tags, current_owner_id())
+        price_val = None
+        if price_raw:
+            price_val = float(price_raw)
+            if price_val < 0:
+                raise ValueError
+    except ValueError:
+        flash("Price per litre must be a non-negative number", "error")
+        return redirect(url_for("new_record_screen"))
+    try:
+        add_record(cow, litres_val, record_date_str, session_val, note, tags, current_owner_id(), price_per_litre=price_val)
     except ValueError:
         flash("Bad date. Use YYYY-MM-DD.", "error")
         return redirect(url_for("new_record_screen"))
@@ -532,14 +572,24 @@ def recent_screen():
         limit = 150
     limit = max(1, min(limit, 500))
     rows = query("""
-        SELECT id, cow_number, litres, record_date, session, note, tags, created_at, edited_at, deleted
+        SELECT id, cow_number, litres, record_date, session, note, tags, price_per_litre, created_at, edited_at, deleted
         FROM milk_records
         WHERE owner_id=?
         ORDER BY id DESC
         LIMIT ?
     """, (current_owner_id(), limit))
+    processed = []
+    for r in rows:
+        litres_val = float(r["litres"] or 0)
+        price_val = float(r["price_per_litre"]) if r["price_per_litre"] is not None else None
+        gain_val = round(litres_val * price_val, 2) if price_val is not None else None
+        item = dict(r)
+        item["litres"] = round(litres_val, 2)
+        item["price_per_litre"] = price_val
+        item["gain"] = gain_val
+        processed.append(item)
     msg = request.args.get("msg")
-    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, limit=limit, msg=msg)
+    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=processed, limit=limit, msg=msg)
 
 @app.route("/update/<int:rec_id>", methods=["POST"])
 @login_required
@@ -548,9 +598,15 @@ def update(rec_id):
     session_val = request.form.get("session")
     note = request.form.get("note", "")
     tags = request.form.get("tags", "")
+    price_raw = request.form.get("price_per_litre")
     try:
         litres_val = float(litres) if litres is not None else None
-        update_record(rec_id, litres_val, session_val, note, tags, current_owner_id())
+        price_val = None
+        if price_raw not in (None, ""):
+            price_val = float(price_raw)
+            if price_val < 0:
+                raise ValueError("price_per_litre must be non-negative")
+        update_record(rec_id, litres_val, session_val, note, tags, current_owner_id(), price_per_litre=price_val)
         return redirect(url_for("recent_screen", msg="Updated."))
     except Exception as e:
         return redirect(url_for("recent_screen", msg=f"Update failed: {e}"))
@@ -585,12 +641,16 @@ def bulk_add():
             try:
                 cow = parts[0]
                 litres = float(parts[1])
-                d = default_date; s = default_session; tags = ""
+                d = default_date; s = default_session; tags = ""; price = None
                 for p in parts[2:]:
                     if p in ("AM","PM"): s = p
                     elif len(p)==10 and p[4]=="-" and p[7]=="-": d = p
+                    elif p.startswith("$"):
+                        price = float(p[1:])
+                    elif p.lower().startswith("price="):
+                        price = float(p.split("=",1)[1])
                     else: tags = (tags + "," + p) if tags else p
-                add_record(cow, litres, d, s, note="", tags=tags, owner_id=current_owner_id())
+                add_record(cow, litres, d, s, note="", tags=tags, owner_id=current_owner_id(), price_per_litre=price)
                 count += 1
             except Exception:
                 continue
@@ -616,7 +676,8 @@ def import_csv():
                         row.get("session", "AM"),
                         row.get("note", "") or "",
                         row.get("tags", "") or "",
-                        current_owner_id()
+                        current_owner_id(),
+                        price_per_litre=row.get("price_per_litre")
                     )
                     count += 1
                 except Exception:
@@ -630,13 +691,15 @@ def import_csv():
 @login_required
 def export_csv():
     rows = query("""
-      SELECT id, cow_number, litres, record_date, session, note, tags, created_at, edited_at, deleted
+      SELECT id, cow_number, litres, record_date, session, note, tags, price_per_litre, created_at, edited_at, deleted
       FROM milk_records
       WHERE owner_id=?
       ORDER BY record_date DESC, id DESC
     """, (current_owner_id(),))
     out = io.StringIO(); w = csv.writer(out)
-    headers = ["id","cow_number","litres","record_date","session","note","tags","created_at","edited_at","deleted"]
+    headers = [
+        "id","cow_number","litres","record_date","session","note","tags","price_per_litre","created_at","edited_at","deleted"
+    ]
     w.writerow(headers)
     for r in rows: w.writerow([r[h] for h in headers])
     out.seek(0)
@@ -648,17 +711,22 @@ def export_excel():
     if Workbook is None:
         return "Excel export not available (openpyxl not installed).", 503
     data = query("""
-      SELECT id, cow_number, litres, record_date, session, note, tags, created_at
+      SELECT id, cow_number, litres, record_date, session, note, tags, price_per_litre, created_at
       FROM milk_records
       WHERE owner_id=? AND deleted=0
       ORDER BY record_date ASC, cow_number ASC, id ASC
     """, (current_owner_id(),))
     wb = Workbook()
     ws = wb.active; ws.title = "Raw Records"
-    ws.append(["ID","Cow #","Litres","Date","Session","Note","Tags","Saved (UTC)"])
+    ws.append(["ID","Cow #","Litres","Date","Session","Note","Tags","Price/L","Saved (UTC)"])
     for r in data:
-        ws.append([r["id"], r["cow_number"], r["litres"], r["record_date"], r["session"], r["note"] or "", r["tags"] or "", r["created_at"]])
-    for col, wdt in zip("ABCDEFGH", [8,10,10,12,10,25,25,25]): ws.column_dimensions[col].width = wdt
+        ws.append([
+            r["id"], r["cow_number"], r["litres"], r["record_date"], r["session"],
+            r["note"] or "", r["tags"] or "", r["price_per_litre"] if r["price_per_litre"] is not None else "",
+            r["created_at"]
+        ])
+    for col, wdt in zip(["A","B","C","D","E","F","G","H","I"], [8,10,10,12,10,25,25,10,25]):
+        ws.column_dimensions[col].width = wdt
     dates_desc = query("""
         SELECT DISTINCT record_date FROM milk_records
         WHERE owner_id=? AND deleted=0
@@ -824,18 +892,25 @@ thead, tbody { display: table; width: 100%; }
 th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 th{color:var(--muted);font-weight:600;background:#0b1220;position:sticky;top:0}
 tr:hover td{background:rgba(120,190,255,.06)}
+tr.row-deleted td{opacity:.45;text-decoration:line-through}
+.stacked-form{display:grid;gap:6px;margin-bottom:8px}
+.inline-actions{display:flex;gap:6px;flex-wrap:wrap}
+.inline-actions form{display:inline-flex;gap:6px}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:rgba(34,197,94,.12);color:#86efac;font-size:12px}
+.small-input{max-width:110px}
 .hint{color:var(--muted);font-size:12px;text-align:center;margin-top:12px}
 .badge{display:inline-block;background:#0b1220;border:1px solid var(--border);color:var(--text);
        border-radius:12px;padding:4px 10px;font-size:12px}
 .subtle{color:var(--muted);font-size:12px;text-align:center;margin-top:14px}
 .header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.hero{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px}
+.hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px}
 .stat{background:#0b1220;border:1px dashed #1b2a3e;border-radius:12px;padding:12px}
 .stat .big{font-weight:900;font-size:22px}
 .flash{margin:8px 0;padding:10px;border-radius:10px}
 .flash.ok{background:#0e3821;border:1px solid #1c7f4b}
 .flash.error{background:#3b0e0e;border:1px solid #7f1d1d}
 small.muted{color:var(--muted)}
+.muted{color:var(--muted)}
 a.link{color:#86efac;text-decoration:underline}
 """
 
@@ -949,6 +1024,7 @@ TPL_HOME = """
 
     <div class="hero">
       <div class="stat"><div class="big">{{ k.tot_litres }}</div><div>Total litres today</div></div>
+      <div class="stat"><div class="big">{{ k.avg_gain }}</div><div>Avg gain per cow</div><div><small class="muted">Total {{ k.total_gain }}</small></div></div>
       <div class="stat"><div class="big">{{ k.milk_per_cow }}</div><div>Milk per cow (L)</div></div>
       <div class="stat"><div class="big">{{ k.cows_recorded }} <small class="muted">({{k.am_coverage}} AM / {{k.pm_coverage}} PM)</small></div><div>Cows recorded today</div></div>
     </div>
@@ -977,7 +1053,154 @@ TPL_HOME = """
 </body></html>
 """
 
-# (The remaining templates TPL_NEW, TPL_RECORDS, TPL_RECENT, TPL_BULK, TPL_IMPORT, TPL_COWS, TPL_HEALTH, TPL_BREEDING, TPL_ALERTS
+TPL_NEW = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>New Record</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.7"/>
+        </svg>
+        <div>
+          <div class="title">New Recording</div>
+          <div class="kicker">Capture litres, price and notes</div>
+        </div>
+      </div>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
+    </div>
+
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% if msgs %}
+        {% for cat, m in msgs %}<div class="flash {{cat}}">{{ m }}</div>{% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="card">
+      <form method="POST" action="{{ url_for('add') }}" class="grid2">
+        <div class="field">
+          <label>Cow number</label>
+          <input name="cow_number" required>
+        </div>
+        <div class="field">
+          <label>Litres</label>
+          <input name="litres" type="number" min="0" step="0.01" required>
+        </div>
+        <div class="field">
+          <label>Price per litre</label>
+          <input name="price_per_litre" type="number" min="0" step="0.01" placeholder="e.g. 0.38">
+        </div>
+        <div class="field">
+          <label>Date</label>
+          <input name="record_date" type="date" value="{{ today }}">
+        </div>
+        <div class="field">
+          <label>Session</label>
+          <select name="session">
+            <option value="AM">AM</option>
+            <option value="PM">PM</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Tags (comma separated)</label>
+          <input name="tags" placeholder="fresh,slow">
+        </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label>Note</label>
+          <textarea name="note" rows="3" placeholder="Optional notes"></textarea>
+        </div>
+        <div><button class="btn" type="submit">Save record</button></div>
+      </form>
+    </div>
+  </div>
+</body></html>
+"""
+
+TPL_RECENT = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recent Entries</title><style>{{ base_css }}</style></head><body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.7"/>
+        </svg>
+        <div>
+          <div class="title">Recent Entries</div>
+          <div class="kicker">Edit litres, price and notes inline</div>
+        </div>
+      </div>
+      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
+    </div>
+
+    {% if msg %}<div class="flash ok">{{ msg }}</div>{% endif %}
+
+    <div class="card">
+      <div class="header-actions">
+        <span class="badge">Showing {{ rows|length }} of {{ limit }}</span>
+        <form method="get" action="{{ url_for('recent_screen') }}" style="display:flex;gap:6px;align-items:center;">
+          <label style="font-size:12px;color:var(--muted)">Limit</label>
+          <input class="small-input" name="limit" type="number" min="1" max="500" value="{{ limit }}">
+          <button class="btn secondary" type="submit">Apply</button>
+        </form>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Cow</th>
+            <th>Date</th>
+            <th>Session</th>
+            <th>Litres</th>
+            <th>Price/L</th>
+            <th>Gain</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr class="{% if r.deleted %}row-deleted{% endif %}">
+            <td>{{ r.id }}</td>
+            <td>{{ r.cow_number }}</td>
+            <td>{{ r.record_date }}</td>
+            <td>{{ r.session }}</td>
+            <td>{{ '%.2f'|format(r.litres) }}</td>
+            <td>{% if r.price_per_litre is not none %}{{ '%.2f'|format(r.price_per_litre) }}{% else %}<span class="pill">No price</span>{% endif %}</td>
+            <td>{% if r.gain is not none %}{{ '%.2f'|format(r.gain) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td>
+              <form method="POST" action="{{ url_for('update', rec_id=r.id) }}" class="stacked-form">
+                <div class="inline-actions">
+                  <input class="small-input" name="litres" type="number" min="0" step="0.01" value="{{ '%.2f'|format(r.litres) }}">
+                  <select name="session">
+                    <option value="AM" {% if r.session=='AM' %}selected{% endif %}>AM</option>
+                    <option value="PM" {% if r.session=='PM' %}selected{% endif %}>PM</option>
+                  </select>
+                  <input class="small-input" name="price_per_litre" type="number" min="0" step="0.01" value="{% if r.price_per_litre is not none %}{{ '%.2f'|format(r.price_per_litre) }}{% endif %}" placeholder="Price">
+                </div>
+                <input name="tags" value="{{ r.tags or '' }}" placeholder="tags">
+                <input name="note" value="{{ r.note or '' }}" placeholder="note">
+                <button class="btn" type="submit">Update</button>
+              </form>
+              <div class="inline-actions">
+                {% if r.deleted %}
+                  <form method="POST" action="{{ url_for('restore', rec_id=r.id) }}"><button class="btn" type="submit">Restore</button></form>
+                {% else %}
+                  <form method="POST" action="{{ url_for('delete', rec_id=r.id) }}"><button class="btn warn" type="submit">Delete</button></form>
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body></html>
+"""
+
+# (The remaining templates TPL_RECORDS, TPL_BULK, TPL_IMPORT, TPL_COWS, TPL_HEALTH, TPL_BREEDING, TPL_ALERTS
 # are identical to your previous v3 code; for brevity they are omitted here as this message is already very long.)
 
 # ---------- Local run ----------
