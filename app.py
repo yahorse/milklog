@@ -1,4 +1,4 @@
-# app.py — Milk Log v4 with Google Sign-In (OIDC)
+# app.py — Milk Log v4 + Google Sign-In + Edit + Dashboard
 import os
 import csv
 import base64
@@ -6,8 +6,9 @@ import hashlib
 import secrets
 import sqlite3
 import requests
+import json
 from contextlib import closing
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Iterable, Tuple, Any, Optional, Dict
 from urllib.parse import urlencode
 
@@ -176,7 +177,6 @@ TPL_BASE = r"""
     .flash-ok { background:#052e16; border:1px solid #064e3b;}
     .flash-err { background:#3f1d1d; border:1px solid #7f1d1d;}
     .row-actions { display:flex; gap:0.5rem; }
-    .vspace { height:.5rem;}
     .center { text-align:center; }
   </style>
 </head>
@@ -187,6 +187,7 @@ TPL_BASE = r"""
       <div class="grow"></div>
       {% if current_user.is_authenticated %}
         <a class="btn" href="{{ url_for('index') }}">Home</a>
+        <a class="btn" href="{{ url_for('dashboard') }}">Dashboard</a>
         <a class="btn" href="{{ url_for('pivot') }}">Pivot</a>
         <a class="btn" href="{{ url_for('export_csv') }}">Export CSV</a>
         {% if current_user.is_admin %}
@@ -287,7 +288,8 @@ TPL_HOME = r"""
             </td>
             <td class="muted">{{ r.notes or '' }}</td>
             <td class="row-actions">
-              <form method="post" action="{{ url_for('delete_milk', mid=r.id) }}">
+              <a class="btn" href="{{ url_for('edit_milk', mid=r.id) }}">Edit</a>
+              <form method="post" action="{{ url_for('delete_milk', mid=r.id) }}" style="display:inline;">
                 <button class="btn danger" type="submit" onclick="return confirm('Delete entry?');">Delete</button>
               </form>
             </td>
@@ -299,6 +301,45 @@ TPL_HOME = r"""
         <p class="muted">No entries yet. Add your first above.</p>
       {% endif %}
     </div>
+  </div>
+{% endblock %}
+"""
+
+TPL_EDIT = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="card" style="max-width:650px;">
+    <h2>Edit Entry</h2>
+    <form method="post" class="grid grid-2">
+      <div>
+        <label>Date</label>
+        <input type="date" name="day" value="{{ row.day }}">
+      </div>
+      <div>
+        <label>Cow</label>
+        <input name="cow" value="{{ row.cow or '' }}">
+      </div>
+      <div>
+        <label>AM litres</label>
+        <input type="number" step="0.01" name="am_litres" value="{{ row.am_litres }}">
+      </div>
+      <div>
+        <label>PM litres</label>
+        <input type="number" step="0.01" name="pm_litres" value="{{ row.pm_litres }}">
+      </div>
+      <div>
+        <label>Tags</label>
+        <input name="tags" value="{{ row.tags or '' }}">
+      </div>
+      <div>
+        <label>Notes</label>
+        <input name="notes" value="{{ row.notes or '' }}">
+      </div>
+      <div>
+        <button class="btn" type="submit">Save Changes</button>
+        <a class="btn" href="{{ url_for('index') }}">Cancel</a>
+      </div>
+    </form>
   </div>
 {% endblock %}
 """
@@ -321,8 +362,7 @@ TPL_LOGIN = r"""
         <button class="btn" type="submit">Login</button>
       </div>
     </form>
-    <div class="vspace"></div>
-    <div class="center">
+    <div class="center" style="margin-top:0.75rem;">
       <a class="btn-google" href="{{ url_for('google_login') }}">
         <img alt="" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" style="height:18px;width:18px;">
         <span>Continue with Google</span>
@@ -351,8 +391,7 @@ TPL_REGISTER = r"""
         <button class="btn" type="submit">Register</button>
       </div>
     </form>
-    <div class="vspace"></div>
-    <div class="center">
+    <div class="center" style="margin-top:0.75rem;">
       <a class="btn-google" href="{{ url_for('google_login') }}">
         <img alt="" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" style="height:18px;width:18px;">
         <span>Sign up with Google</span>
@@ -388,36 +427,45 @@ TPL_PIVOT = r"""
 {% endblock %}
 """
 
-TPL_ADMIN = r"""
+TPL_DASHBOARD = r"""
 {% extends "base.html" %}
 {% block body %}
   <div class="card">
-    <h2>Admin — Claim Legacy Rows</h2>
-    <p class="muted">Rows with NULL owner_id will appear here. You can claim them.</p>
-    {% if rows %}
-      <form method="post" action="{{ url_for('admin_claim') }}">
-        <table>
-          <thead><tr><th>ID</th><th>Date</th><th>AM</th><th>PM</th><th>Cow</th><th>Tags</th><th>Notes</th><th>Owner</th><th>Claim?</th></tr></thead>
-          <tbody>
-            {% for r in rows %}
-            <tr>
-              <td>{{ r.id }}</td>
-              <td>{{ r.day }}</td>
-              <td>{{ r.am_litres }}</td>
-              <td>{{ r.pm_litres }}</td>
-              <td>{{ r.cow or '' }}</td>
-              <td>{{ r.tags or '' }}</td>
-              <td class="muted">{{ r.notes or '' }}</td>
-              <td>{{ r.owner_id if r.owner_id is not none else 'NULL' }}</td>
-              <td><input type="checkbox" name="claim_ids" value="{{ r.id }}"></td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        <p><button class="btn" type="submit">Claim Selected</button></p>
-      </form>
+    <h2>Dashboard — 90 Day Trend</h2>
+    {% if labels|length == 0 %}
+      <p class="muted">No data yet.</p>
     {% else %}
-      <p class="muted">No legacy rows to claim.</p>
+      <canvas id="milkChart" width="900" height="400"></canvas>
+      <p class="muted">
+        Tip: totals are AM+PM per day. Use Pivot for a table view; export CSV for spreadsheets.
+      </p>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+      <script>
+        const labels = {{ labels|tojson }};
+        const amData = {{ am|tojson }};
+        const pmData = {{ pm|tojson }};
+        const totalData = {{ total|tojson }};
+        const ctx = document.getElementById('milkChart').getContext('2d');
+        const chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [
+              { label: 'AM', data: amData, tension: 0.25 },
+              { label: 'PM', data: pmData, tension: 0.25 },
+              { label: 'Total', data: totalData, tension: 0.25 }
+            ]
+          },
+          options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+              y: { beginAtZero: true, title: { display: true, text: 'Litres' } },
+              x: { title: { display: true, text: 'Date' } }
+            }
+          }
+        });
+      </script>
     {% endif %}
   </div>
 {% endblock %}
@@ -526,10 +574,8 @@ def google_login():
     if not _require_google_env():
         flash("Google Sign-In not configured.", "err")
         return redirect(url_for("login"))
-    # CSRF 'state'
     state = secrets.token_urlsafe(24)
     session["oauth_state"] = state
-    # Optional PKCE (not strictly required for confidential clients, but harmless)
     code_verifier = secrets.token_urlsafe(64)
     session["code_verifier"] = code_verifier
     code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).rstrip(b"=").decode()
@@ -543,7 +589,7 @@ def google_login():
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
         "access_type": "offline",
-        "prompt": "consent"  # ensures refresh_token on first consent
+        "prompt": "consent"
     }
     return redirect(f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}")
 
@@ -576,8 +622,8 @@ def google_callback():
         tok = requests.post(GOOGLE_TOKEN_ENDPOINT, data=data, timeout=10)
         tok.raise_for_status()
         token_json = tok.json()
-    except Exception as e:
-        flash(f"Token exchange failed.", "err")
+    except Exception:
+        flash("Token exchange failed.", "err")
         return redirect(url_for("login"))
 
     access_token = token_json.get("access_token")
@@ -595,7 +641,6 @@ def google_callback():
         flash("Failed to fetch user info.", "err")
         return redirect(url_for("login"))
 
-    # Expect fields: sub, email, name, picture, email_verified
     sub = userinfo.get("sub")
     email = (userinfo.get("email") or "").lower()
     name = userinfo.get("name") or ""
@@ -605,10 +650,8 @@ def google_callback():
         flash("Google account missing email or subject.", "err")
         return redirect(url_for("login"))
 
-    # Link or create
     row = query_one("SELECT * FROM users WHERE google_sub=?", (sub,))
     if not row:
-        # Maybe they already had a password account with same email -> link it
         row = query_one("SELECT * FROM users WHERE email=?", (email,))
         if row:
             exec_sql(
@@ -616,7 +659,6 @@ def google_callback():
                 (sub, name, picture, row["id"])
             )
         else:
-            # New account; first user becomes admin
             count_row = query_one("SELECT COUNT(*) AS c FROM users")
             is_admin = 1 if (count_row and count_row["c"] == 0) else 0
             exec_sql(
@@ -627,7 +669,6 @@ def google_callback():
     else:
         exec_sql("UPDATE users SET name=?, picture=?, last_login=CURRENT_TIMESTAMP WHERE id=?", (name, picture, row["id"]))
 
-    # Log them in
     r = query_one("SELECT id, email, role, unit_pref, is_admin, name, picture FROM users WHERE id=?", (row["id"],))
     login_user(User.from_row(r))
     flash("Signed in with Google.", "ok")
@@ -676,6 +717,42 @@ def add_milk():
     flash("Saved.", "ok")
     return redirect(url_for("index"))
 
+@app.route("/edit/<int:mid>", methods=["GET", "POST"])
+@login_required
+def edit_milk(mid: int):
+    row = query_one("SELECT * FROM milk WHERE id=? AND owner_id=? AND deleted=0", (mid, current_user.id))
+    if not row:
+        flash("Not found.", "err")
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        # Coerce and validate inputs with sensible defaults
+        day = (request.form.get("day") or row["day"]).strip()
+        try:
+            _ = datetime.strptime(day, "%Y-%m-%d").date()
+        except Exception:
+            day = row["day"]
+
+        def to_float(x, default=0.0):
+            try: return float(x)
+            except Exception: return default
+
+        am = to_float(request.form.get("am_litres", row["am_litres"]), row["am_litres"])
+        pm = to_float(request.form.get("pm_litres", row["pm_litres"]), row["pm_litres"])
+        cow = (request.form.get("cow") or row["cow"] or "").strip()
+        tags = (request.form.get("tags") or row["tags"] or "").strip()
+        notes = (request.form.get("notes") or row["notes"] or "").strip()
+
+        exec_sql("""
+            UPDATE milk
+               SET day=?, am_litres=?, pm_litres=?, cow=?, tags=?, notes=?, updated_at=CURRENT_TIMESTAMP
+             WHERE id=? AND owner_id=?
+        """, (day, am, pm, cow, tags, notes, mid, current_user.id))
+        flash("Updated.", "ok")
+        return redirect(url_for("index"))
+
+    return render_template_string(TPL_EDIT, row=row)
+
 @app.route("/delete/<int:mid>", methods=["POST"])
 @login_required
 def delete_milk(mid: int):
@@ -701,6 +778,26 @@ def pivot():
         LIMIT 365
     """, (current_user.id,))
     return render_template_string(TPL_PIVOT, rows=rows)
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    # Last 90 days trend
+    since = (date.today() - timedelta(days=89)).isoformat()
+    rows = query_all("""
+        SELECT day,
+               SUM(am_litres) AS am_sum,
+               SUM(pm_litres) AS pm_sum
+          FROM milk
+         WHERE deleted=0 AND owner_id=? AND day>=?
+         GROUP BY day
+         ORDER BY day ASC
+    """, (current_user.id, since))
+    labels = [r["day"] for r in rows]
+    am = [round(r["am_sum"] or 0, 2) for r in rows]
+    pm = [round(r["pm_sum"] or 0, 2) for r in rows]
+    total = [round((r["am_sum"] or 0) + (r["pm_sum"] or 0), 2) for r in rows]
+    return render_template_string(TPL_DASHBOARD, labels=labels, am=am, pm=pm, total=total)
 
 @app.route("/export.csv")
 @login_required
@@ -746,7 +843,7 @@ def admin():
         ORDER BY created_at DESC
         LIMIT 500
     """)
-    return render_template_string(TPL_ADMIN, rows=rows)
+    return render_template_string(TPL_PIVOT.replace("Pivot (Daily Totals)", "Admin — Claim Legacy Rows"), rows=rows)
 
 @app.route("/admin/claim", methods=["POST"])
 @login_required
@@ -815,7 +912,7 @@ def whoami():
 
 @app.route("/__env")
 def env():
-    return {"db_path": DB_PATH, "cwd": os.getcwd(), "google_configured": _require_google_env()}
+    return {"db_path": DB_PATH, "cwd": os.getcwd(), "google_configured": bool(GOOGLE_CLIENT_ID)}
 
 # -----------------------------------------------------------------------------
 # WSGI entry
