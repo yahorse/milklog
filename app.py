@@ -1,21 +1,26 @@
-# app.py — Milk Log v4 (v2 loader + SW fix)
+# app.py — Milk Log v4 with Google Sign-In (OIDC)
 import os
 import csv
+import base64
+import hashlib
+import secrets
 import sqlite3
+import requests
 from contextlib import closing
 from datetime import datetime, date
 from typing import Iterable, Tuple, Any, Optional, Dict
+from urllib.parse import urlencode
 
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
-    Response, flash, jsonify
+    Response, flash, jsonify, session
 )
 from flask_login import (
     LoginManager, UserMixin, login_user, login_required,
     logout_user, current_user
 )
 from werkzeug.security import generate_password_hash, check_password_hash
-from jinja2 import DictLoader  # <-- proper loader
+from jinja2 import DictLoader
 
 # -----------------------------------------------------------------------------
 # App / Config
@@ -23,6 +28,16 @@ from jinja2 import DictLoader  # <-- proper loader
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 DB_PATH = os.environ.get("DATABASE_PATH", "milklog.db")
+
+# Google OAuth / OIDC
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")  # e.g. https://milklog.onrender.com/auth/google/callback
+
+# Google endpoints
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
 
 _db_dir = os.path.dirname(DB_PATH)
 if _db_dir and not os.path.exists(_db_dir):
@@ -68,15 +83,19 @@ def init_db() -> None:
     with closing(get_db()) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
 
-        # users table
+        # users table (+ google fields)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
+            password_hash TEXT,
             role TEXT NOT NULL DEFAULT 'user',
             unit_pref TEXT NOT NULL DEFAULT 'L',
             is_admin INTEGER NOT NULL DEFAULT 0,
+            google_sub TEXT,            -- OIDC 'sub'
+            name TEXT,
+            picture TEXT,
+            last_login TIMESTAMP,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """)
@@ -87,6 +106,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT NOT NULL DEFAULT 'L';")
         if "is_admin" not in ucols:
             conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;")
+        if "google_sub" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT;")
+        if "name" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN name TEXT;")
+        if "picture" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN picture TEXT;")
+        if "last_login" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_login TIMESTAMP;")
+        if "password_hash" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
 
         # milk table
         conn.execute("""
@@ -131,6 +160,7 @@ TPL_BASE = r"""
     .nav .grow { flex:1; }
     .btn { background:#111827; border:1px solid #374151; padding:0.45rem 0.8rem; border-radius:10px; color:#e5e7eb; cursor:pointer;}
     .btn:hover { background:#0f172a; }
+    .btn-google { background:#1f2937; border:1px solid #374151; padding:0.55rem 0.9rem; border-radius:10px; display:inline-flex; align-items:center; gap:.5rem;}
     .card { background:#0b1324; border:1px solid #1f2937; border-radius:14px; padding:1rem; }
     input, select, textarea { width:100%; background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:10px; padding:0.5rem;}
     table { width:100%; border-collapse: collapse; }
@@ -146,6 +176,8 @@ TPL_BASE = r"""
     .flash-ok { background:#052e16; border:1px solid #064e3b;}
     .flash-err { background:#3f1d1d; border:1px solid #7f1d1d;}
     .row-actions { display:flex; gap:0.5rem; }
+    .vspace { height:.5rem;}
+    .center { text-align:center; }
   </style>
 </head>
 <body>
@@ -279,17 +311,24 @@ TPL_LOGIN = r"""
     <form method="post" class="grid">
       <div>
         <label>Email</label>
-        <input name="email" type="email" required>
+        <input name="email" type="email" autocomplete="username" required>
       </div>
       <div>
         <label>Password</label>
-        <input name="password" type="password" required>
+        <input name="password" type="password" autocomplete="current-password" required>
       </div>
       <div>
         <button class="btn" type="submit">Login</button>
       </div>
     </form>
-    <p class="muted">No account? <a href="{{ url_for('register') }}">Register</a></p>
+    <div class="vspace"></div>
+    <div class="center">
+      <a class="btn-google" href="{{ url_for('google_login') }}">
+        <img alt="" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" style="height:18px;width:18px;">
+        <span>Continue with Google</span>
+      </a>
+    </div>
+    <p class="muted center">No account? <a href="{{ url_for('register') }}">Register</a></p>
   </div>
 {% endblock %}
 """
@@ -302,16 +341,23 @@ TPL_REGISTER = r"""
     <form method="post" class="grid">
       <div>
         <label>Email</label>
-        <input name="email" type="email" required>
+        <input name="email" type="email" autocomplete="username" required>
       </div>
       <div>
         <label>Password</label>
-        <input name="password" type="password" required>
+        <input name="password" type="password" autocomplete="new-password" required>
       </div>
       <div>
         <button class="btn" type="submit">Register</button>
       </div>
     </form>
+    <div class="vspace"></div>
+    <div class="center">
+      <a class="btn-google" href="{{ url_for('google_login') }}">
+        <img alt="" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" style="height:18px;width:18px;">
+        <span>Sign up with Google</span>
+      </a>
+    </div>
   </div>
 {% endblock %}
 """
@@ -385,12 +431,15 @@ app.jinja_loader = DictLoader({"base.html": TPL_BASE})
 # -----------------------------------------------------------------------------
 class User(UserMixin):
     def __init__(self, id: int, email: str, role: str = "user",
-                 unit_pref: str = "L", is_admin: bool = False):
+                 unit_pref: str = "L", is_admin: bool = False,
+                 name: str = "", picture: str = ""):
         self.id = id
         self.email = email
         self.role = role
         self.unit_pref = unit_pref
         self.is_admin = bool(is_admin)
+        self.name = name
+        self.picture = picture
 
     @staticmethod
     def from_row(r: sqlite3.Row) -> "User":
@@ -400,13 +449,15 @@ class User(UserMixin):
             role=r["role"] if "role" in r.keys() else "user",
             unit_pref=r["unit_pref"] if "unit_pref" in r.keys() else "L",
             is_admin=bool(r["is_admin"]) if "is_admin" in r.keys() else False,
+            name=r["name"] if "name" in r.keys() and r["name"] else "",
+            picture=r["picture"] if "picture" in r.keys() and r["picture"] else "",
         )
 
 @login_manager.user_loader
 def load_user(user_id: str) -> Optional[User]:
     try:
         r = query_one(
-            "SELECT id, email, role, unit_pref, is_admin FROM users WHERE id=?",
+            "SELECT id, email, role, unit_pref, is_admin, name, picture FROM users WHERE id=?",
             (user_id,)
         )
     except sqlite3.OperationalError:
@@ -415,7 +466,7 @@ def load_user(user_id: str) -> Optional[User]:
     return User.from_row(r) if r else None
 
 # -----------------------------------------------------------------------------
-# Auth routes
+# Auth routes — Email/Password
 # -----------------------------------------------------------------------------
 @app.route("/register", methods=["GET", "POST"])
 def register():
@@ -434,10 +485,10 @@ def register():
         count_row = query_one("SELECT COUNT(*) AS c FROM users")
         is_admin = 1 if (count_row and count_row["c"] == 0) else 0
         exec_sql(
-            "INSERT INTO users(email, password_hash, role, unit_pref, is_admin) VALUES(?,?,?,?,?)",
+            "INSERT INTO users(email, password_hash, role, unit_pref, is_admin, last_login) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)",
             (email, generate_password_hash(password), "user", "L", is_admin)
         )
-        user_row = query_one("SELECT id, email, role, unit_pref, is_admin FROM users WHERE email=?", (email,))
+        user_row = query_one("SELECT id, email, role, unit_pref, is_admin, name, picture FROM users WHERE email=?", (email,))
         login_user(User.from_row(user_row))
         flash("Welcome to MilkLog!", "ok")
         return redirect(url_for("index"))
@@ -448,13 +499,10 @@ def login():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
-        row = query_one("SELECT id, email, password_hash, role, unit_pref, is_admin FROM users WHERE email=?", (email,))
-        if row and check_password_hash(row["password_hash"], password):
-            user = User(
-                id=row["id"], email=row["email"],
-                role=row["role"], unit_pref=row["unit_pref"], is_admin=bool(row["is_admin"])
-            )
-            login_user(user)
+        row = query_one("SELECT id, email, password_hash, role, unit_pref, is_admin, name, picture FROM users WHERE email=?", (email,))
+        if row and row["password_hash"] and check_password_hash(row["password_hash"], password):
+            exec_sql("UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+            login_user(User.from_row(row))
             flash("Logged in.", "ok")
             return redirect(url_for("index"))
         flash("Invalid credentials.", "err")
@@ -466,6 +514,124 @@ def logout():
     logout_user()
     flash("Logged out.", "ok")
     return redirect(url_for("login"))
+
+# -----------------------------------------------------------------------------
+# Auth routes — Google OIDC
+# -----------------------------------------------------------------------------
+def _require_google_env() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and OAUTH_REDIRECT_URI)
+
+@app.route("/auth/google")
+def google_login():
+    if not _require_google_env():
+        flash("Google Sign-In not configured.", "err")
+        return redirect(url_for("login"))
+    # CSRF 'state'
+    state = secrets.token_urlsafe(24)
+    session["oauth_state"] = state
+    # Optional PKCE (not strictly required for confidential clients, but harmless)
+    code_verifier = secrets.token_urlsafe(64)
+    session["code_verifier"] = code_verifier
+    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).rstrip(b"=").decode()
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "access_type": "offline",
+        "prompt": "consent"  # ensures refresh_token on first consent
+    }
+    return redirect(f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}")
+
+@app.route("/auth/google/callback")
+def google_callback():
+    if not _require_google_env():
+        flash("Google Sign-In not configured.", "err")
+        return redirect(url_for("login"))
+
+    state = request.args.get("state", "")
+    if not state or state != session.get("oauth_state"):
+        flash("OAuth state mismatch.", "err")
+        return redirect(url_for("login"))
+
+    code = request.args.get("code", "")
+    if not code:
+        flash("Missing authorization code.", "err")
+        return redirect(url_for("login"))
+
+    code_verifier = session.get("code_verifier", "")
+    data = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "grant_type": "authorization_code",
+        "code_verifier": code_verifier,
+    }
+    try:
+        tok = requests.post(GOOGLE_TOKEN_ENDPOINT, data=data, timeout=10)
+        tok.raise_for_status()
+        token_json = tok.json()
+    except Exception as e:
+        flash(f"Token exchange failed.", "err")
+        return redirect(url_for("login"))
+
+    access_token = token_json.get("access_token")
+    if not access_token:
+        flash("No access token from Google.", "err")
+        return redirect(url_for("login"))
+
+    try:
+        userinfo = requests.get(
+            GOOGLE_USERINFO_ENDPOINT,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10
+        ).json()
+    except Exception:
+        flash("Failed to fetch user info.", "err")
+        return redirect(url_for("login"))
+
+    # Expect fields: sub, email, name, picture, email_verified
+    sub = userinfo.get("sub")
+    email = (userinfo.get("email") or "").lower()
+    name = userinfo.get("name") or ""
+    picture = userinfo.get("picture") or ""
+
+    if not sub or not email:
+        flash("Google account missing email or subject.", "err")
+        return redirect(url_for("login"))
+
+    # Link or create
+    row = query_one("SELECT * FROM users WHERE google_sub=?", (sub,))
+    if not row:
+        # Maybe they already had a password account with same email -> link it
+        row = query_one("SELECT * FROM users WHERE email=?", (email,))
+        if row:
+            exec_sql(
+                "UPDATE users SET google_sub=?, name=?, picture=?, last_login=CURRENT_TIMESTAMP WHERE id=?",
+                (sub, name, picture, row["id"])
+            )
+        else:
+            # New account; first user becomes admin
+            count_row = query_one("SELECT COUNT(*) AS c FROM users")
+            is_admin = 1 if (count_row and count_row["c"] == 0) else 0
+            exec_sql(
+                "INSERT INTO users(email, google_sub, name, picture, role, unit_pref, is_admin, last_login) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (email, sub, name, picture, "user", "L", is_admin)
+            )
+            row = query_one("SELECT * FROM users WHERE email=?", (email,))
+    else:
+        exec_sql("UPDATE users SET name=?, picture=?, last_login=CURRENT_TIMESTAMP WHERE id=?", (name, picture, row["id"]))
+
+    # Log them in
+    r = query_one("SELECT id, email, role, unit_pref, is_admin, name, picture FROM users WHERE id=?", (row["id"],))
+    login_user(User.from_row(r))
+    flash("Signed in with Google.", "ok")
+    return redirect(url_for("index"))
 
 # -----------------------------------------------------------------------------
 # App routes
@@ -637,7 +803,6 @@ self.addEventListener('activate', event => { event.waitUntil(clients.claim()); }
 def healthz():
     return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
 
-# Handy debug endpoints
 @app.route("/ping")
 def ping():
     return "ok"
@@ -650,7 +815,7 @@ def whoami():
 
 @app.route("/__env")
 def env():
-    return {"db_path": DB_PATH, "cwd": os.getcwd()}
+    return {"db_path": DB_PATH, "cwd": os.getcwd(), "google_configured": _require_google_env()}
 
 # -----------------------------------------------------------------------------
 # WSGI entry
