@@ -1,1055 +1,655 @@
 # app.py
-# Milk Log — single-file Flask app
-# Features in this build:
-# - Email/password auth + Google Sign-In (OIDC), multi-tenant isolation, admin role
-# - Add/update/delete milk records; recent table; records pivot; CSV/Excel export
-# - PWA (manifest + service worker)
-# - CSRF protection (lightweight) + rate limiting on auth
-# - Finance: per-user price-per-litre + currency; dashboard shows Revenue today & 7-day avg revenue/day
+# Milk Log v4 — Single-file Flask app for Render (gunicorn app:app)
+# Features:
+# - Users: register/login/logout (Flask-Login, hashed passwords)
+# - First user becomes admin
+# - owner_id on milk rows; all queries scoped to current_user
+# - Add/Delete milk entries, tags/notes, per-day pivot, CSV export
+# - Admin page to claim legacy rows missing owner_id
+# - PWA: manifest + service worker
+# - SQLite with WAL; idempotent schema bootstrap/migrations
 
-import os, io, csv, json, time, secrets, sqlite3
-from collections import defaultdict, deque
+import os
+import csv
+import sqlite3
 from contextlib import closing
 from datetime import datetime, date
+from typing import Iterable, Tuple, Any, Optional, Dict
 
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
-    send_file, flash, Response, session, abort
+    Response, flash, jsonify
 )
-from werkzeug.security import generate_password_hash, check_password_hash
 from flask_login import (
     LoginManager, UserMixin, login_user, login_required,
     logout_user, current_user
 )
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Google OAuth
-from authlib.integrations.flask_client import OAuth
-import requests  # not used directly, but handy for debugging provider calls
-
-try:
-    from openpyxl import Workbook
-except Exception:
-    Workbook = None
-
+# -----------------------------------------------------------------------------
+# App / Config
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-please-change")
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+DB_PATH = os.environ.get("DATABASE_PATH", "milklog.db")
 
-# -------- Storage paths --------
-DATA_DIR = os.getenv("DATA_DIR", "/var/data")
-if not os.path.isdir(DATA_DIR):
-    DATA_DIR = "."
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "milk_records.db")
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir and not os.path.exists(_db_dir):
+    os.makedirs(_db_dir, exist_ok=True)
 
-# -------- Auth (Flask-Login) --------
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
-class User(UserMixin):
-    def __init__(self, row):
-        self.id = row["id"]
-        self.email = row["email"]
-        self.role = row["role"]
-        self.unit_pref = row["unit_pref"]
+# -----------------------------------------------------------------------------
+# DB helpers
+# -----------------------------------------------------------------------------
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    @property
-    def is_admin(self):
-        return self.role == "admin"
+def exec_sql(sql: str, args: Tuple[Any, ...] = ()) -> None:
+    with closing(get_db()) as conn, conn:
+        conn.execute(sql, args)
 
-@login_manager.user_loader
-def load_user(user_id):
-    row = query_one("SELECT id, email, role, COALESCE(unit_pref,'L') AS unit_pref FROM users WHERE id=?", (user_id,))
-    return User(row) if row else None
+def exec_many(sql: str, rows: Iterable[Tuple[Any, ...]]) -> None:
+    with closing(get_db()) as conn, conn:
+        conn.executemany(sql, list(rows))
 
-# -------- Google OAuth (Authlib) --------
-oauth = OAuth(app)
-oauth.register(
-    name="google",
-    client_id=os.getenv("GOOGLE_CLIENT_ID"),
-    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
-)
+def query_all(sql: str, args: Tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    with closing(get_db()) as conn:
+        cur = conn.execute(sql, args)
+        return cur.fetchall()
 
-# -------- DB helpers --------
-def connect():
-    return sqlite3.connect(DB_PATH)
-
-def query(sql, args=()):
-    with closing(connect()) as conn:
-        conn.row_factory = sqlite3.Row
-        return conn.execute(sql, args).fetchall()
-
-def query_one(sql, args=()):
-    with closing(connect()) as conn:
-        conn.row_factory = sqlite3.Row
+def query_one(sql: str, args: Tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
+    with closing(get_db()) as conn:
         cur = conn.execute(sql, args)
         return cur.fetchone()
 
-def exec_write(sql, args=()):
-    with closing(connect()) as conn, conn:
-        conn.execute(sql, args)
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {r[1] for r in cur.fetchall()}
 
-def columns(conn, table):
-    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-
-# -------- Schema & migrations --------
-def init_db():
-    with closing(connect()) as conn, conn:
+# -----------------------------------------------------------------------------
+# Schema bootstrap / migrations (idempotent)
+# -----------------------------------------------------------------------------
+def init_db() -> None:
+    with closing(get_db()) as conn, conn:
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
 
-        # ---------- users ----------
+        # users table
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('admin','user')),
-            created_at TEXT NOT NULL,
-            unit_pref TEXT DEFAULT 'L',
-            milk_price_per_litre REAL DEFAULT 0.0,
-            currency TEXT DEFAULT '€',
-            google_sub TEXT,
-            name TEXT,
-            avatar TEXT
-        )
+            role TEXT NOT NULL DEFAULT 'user',
+            unit_pref TEXT NOT NULL DEFAULT 'L',
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """)
-
-        ucols = columns(conn, "users")
+        ucols = table_columns(conn, "users")
+        if "role" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';")
         if "unit_pref" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT DEFAULT 'L'")
-        if "milk_price_per_litre" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN milk_price_per_litre REAL DEFAULT 0.0")
-        if "currency" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT '€'")
-        if "google_sub" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
-        if "name" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
-        if "avatar" not in ucols:
-            conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+            conn.execute("ALTER TABLE users ADD COLUMN unit_pref TEXT NOT NULL DEFAULT 'L';")
+        if "is_admin" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;")
 
-        # unique indexes
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
-
-        # ---------- milk_records ----------
+        # milk table
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS milk_records (
+        CREATE TABLE IF NOT EXISTS milk (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cow_number TEXT NOT NULL,
-            litres REAL NOT NULL CHECK(litres >= 0),
-            record_date TEXT NOT NULL,
-            session TEXT DEFAULT 'AM' CHECK(session IN ('AM','PM')),
-            note TEXT,
+            owner_id INTEGER,
+            day DATE NOT NULL,
+            am_litres REAL NOT NULL DEFAULT 0,
+            pm_litres REAL NOT NULL DEFAULT 0,
+            cow TEXT,
             tags TEXT,
-            deleted INTEGER DEFAULT 0 CHECK(deleted IN (0,1)),
-            owner_id INTEGER,
-            created_at TEXT NOT NULL,
-            edited_at TEXT,
-            FOREIGN KEY(owner_id) REFERENCES users(id)
-        )
+            notes TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        );
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_owner_day ON milk(owner_id, day);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_deleted ON milk(deleted);")
 
-        mcols = columns(conn, "milk_records")
-        if "session" not in mcols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN session TEXT DEFAULT 'AM'")
-        if "note" not in mcols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN note TEXT")
-        if "tags" not in mcols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN tags TEXT")
-        if "deleted" not in mcols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN deleted INTEGER DEFAULT 0")
-        if "owner_id" not in mcols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN owner_id INTEGER")
-        if "edited_at" not in mcols:
-            conn.execute("ALTER TABLE milk_records ADD COLUMN edited_at TEXT")
+# Call at import so workers are ready
+init_db()
 
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_date ON milk_records(record_date)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_cow ON milk_records(cow_number)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_milk_owner ON milk_records(owner_id)")
+# -----------------------------------------------------------------------------
+# User model / loader
+# -----------------------------------------------------------------------------
+class User(UserMixin):
+    def __init__(self, id: int, email: str, role: str = "user",
+                 unit_pref: str = "L", is_admin: bool = False):
+        self.id = id
+        self.email = email
+        self.role = role
+        self.unit_pref = unit_pref
+        self.is_admin = bool(is_admin)
 
-        # ---------- cows ----------
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS cows (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tag TEXT UNIQUE NOT NULL,
-            name TEXT,
-            breed TEXT,
-            parity INTEGER,
-            dob TEXT,
-            latest_calving TEXT,
-            group_name TEXT,
-            owner_id INTEGER,
-            created_at TEXT,
-            edited_at TEXT,
-            FOREIGN KEY(owner_id) REFERENCES users(id)
+    @staticmethod
+    def from_row(r: sqlite3.Row) -> "User":
+        return User(
+            id=r["id"],
+            email=r["email"],
+            role=r["role"] if "role" in r.keys() else "user",
+            unit_pref=r["unit_pref"] if "unit_pref" in r.keys() else "L",
+            is_admin=bool(r["is_admin"]) if "is_admin" in r.keys() else False,
         )
-        """)
 
-        ccols = columns(conn, "cows")
-        if "name" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN name TEXT")
-        if "breed" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN breed TEXT")
-        if "parity" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN parity INTEGER")
-        if "dob" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN dob TEXT")
-        if "latest_calving" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN latest_calving TEXT")
-        if "group_name" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN group_name TEXT")
-        if "owner_id" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN owner_id INTEGER")
-        if "created_at" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN created_at TEXT")
-        if "edited_at" not in ccols:
-            conn.execute("ALTER TABLE cows ADD COLUMN edited_at TEXT")
+@login_manager.user_loader
+def load_user(user_id: str) -> Optional[User]:
+    try:
+        r = query_one(
+            "SELECT id, email, role, unit_pref, is_admin FROM users WHERE id=?",
+            (user_id,)
+        )
+    except sqlite3.OperationalError:
+        # If startup race, try to bootstrap
+        init_db()
+        r = None
+    return User.from_row(r) if r else None
 
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_tag ON cows(tag)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_group ON cows(group_name)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cows_owner ON cows(owner_id)")
+# -----------------------------------------------------------------------------
+# Templates
+# -----------------------------------------------------------------------------
+TPL_BASE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MilkLog</title>
+  <link rel="manifest" href="{{ url_for('manifest') }}">
+  <meta name="theme-color" content="#0f172a">
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b1220; color:#e5e7eb;}
+    a { color:#93c5fd; text-decoration:none;}
+    header { background:#0a0f1a; border-bottom:1px solid #1f2937; position:sticky; top:0; z-index:10;}
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 1rem; }
+    .nav { display:flex; gap:1rem; align-items:center; }
+    .nav .grow { flex:1; }
+    .btn { background:#111827; border:1px solid #374151; padding:0.45rem 0.8rem; border-radius:10px; color:#e5e7eb; cursor:pointer;}
+    .btn:hover { background:#0f172a; }
+    .card { background:#0b1324; border:1px solid #1f2937; border-radius:14px; padding:1rem; }
+    input, select, textarea { width:100%; background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:10px; padding:0.5rem;}
+    table { width:100%; border-collapse: collapse; }
+    th, td { text-align:left; padding:0.5rem; border-bottom:1px solid #1f2937; vertical-align:top;}
+    .grid { display:grid; gap:1rem; }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .muted { color:#94a3b8; }
+    .danger { color:#fda4af; }
+    .success { color:#86efac; }
+    .tag { display:inline-block; padding:0.15rem 0.5rem; border:1px solid #334155; border-radius:999px; margin-right:0.25rem; font-size:0.8rem; color:#93c5fd;}
+    footer { color:#94a3b8; font-size:0.9rem; padding:2rem 0; text-align:center;}
+    .flash { padding:0.5rem 0.75rem; border-radius:10px; margin: 0.25rem 0; }
+    .flash-ok { background:#052e16; border:1px solid #064e3b;}
+    .flash-err { background:#3f1d1d; border:1px solid #7f1d1d;}
+    .row-actions { display:flex; gap:0.5rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap nav">
+      <div><strong>🥛 MilkLog</strong></div>
+      <div class="grow"></div>
+      {% if current_user.is_authenticated %}
+        <a class="btn" href="{{ url_for('index') }}">Home</a>
+        <a class="btn" href="{{ url_for('pivot') }}">Pivot</a>
+        <a class="btn" href="{{ url_for('export_csv') }}">Export CSV</a>
+        {% if current_user.is_admin %}
+          <a class="btn" href="{{ url_for('admin') }}">Admin</a>
+        {% endif %}
+        <form method="post" action="{{ url_for('logout') }}" style="display:inline;">
+          <button class="btn" type="submit">Logout ({{ current_user.email }})</button>
+        </form>
+      {% else %}
+        <a class="btn" href="{{ url_for('login') }}">Login</a>
+        <a class="btn" href="{{ url_for('register') }}">Register</a>
+      {% endif %}
+    </div>
+  </header>
 
+  <main class="wrap">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="flash {% if cat=='ok' %}flash-ok{% else %}flash-err{% endif %}">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+    {% block body %}{% endblock %}
+  </main>
 
-# -------- Utilities --------
-def today_str():
-    return date.today().isoformat()
+  <footer>
+    <div class="wrap">PWA ready. <span class="muted">Add to Home Screen for quick entry.</span></div>
+  </footer>
 
-def current_owner_id():
-    return current_user.id if current_user.is_authenticated else None
-
-def unit_pref_for():
-    if current_user.is_authenticated:
-        r = query_one("SELECT COALESCE(unit_pref,'L') AS u FROM users WHERE id=?", (current_user.id,))
-        return r["u"] if r else "L"
-    return "L"
-
-def to_display_litres(litres):
-    if unit_pref_for() == "gal":
-        return round(litres * 0.264172, 2), "gal"
-    return round(litres, 2), "L"
-
-def finance_prefs():
-    if not current_user.is_authenticated:
-        return {"price": 0.0, "ccy": "€"}
-    r = query_one("SELECT COALESCE(milk_price_per_litre,0.0) AS price, COALESCE(currency,'€') AS ccy FROM users WHERE id=?",
-                  (current_user.id,))
-    return {"price": float(r["price"] or 0.0), "ccy": r["ccy"] or "€"}
-
-def kpis_for_home(owner_id):
-    t = today_str()
-    row = query("""
-      SELECT COALESCE(SUM(litres),0) AS tot
-      FROM milk_records
-      WHERE deleted=0 AND record_date=? AND owner_id=?
-    """, (t, owner_id))
-    tot_l = float(row[0]["tot"]) if row else 0.0
-
-    cows = query("""
-      SELECT COUNT(DISTINCT cow_number) AS n
-      FROM milk_records
-      WHERE deleted=0 AND record_date=? AND owner_id=?
-    """, (t, owner_id))
-    n_cows = int(cows[0]["n"]) if cows else 0
-
-    am = query("""
-      SELECT COUNT(DISTINCT cow_number) AS n
-      FROM milk_records
-      WHERE deleted=0 AND record_date=? AND session='AM' AND owner_id=?
-    """, (t, owner_id))
-    pm = query("""
-      SELECT COUNT(DISTINCT cow_number) AS n
-      FROM milk_records
-      WHERE deleted=0 AND record_date=? AND session='PM' AND owner_id=?
-    """, (t, owner_id))
-    am_n = int(am[0]["n"]) if am else 0
-    pm_n = int(pm[0]["n"]) if pm else 0
-
-    mlk_per_cow = round(tot_l / n_cows, 2) if n_cows else 0.0
-
-    fp = finance_prefs()
-    revenue_today = round(tot_l * fp["price"], 2)
-
-    # 7-day average revenue/day (only days with any milk)
-    days = query("""
-      SELECT record_date, SUM(litres) AS litres
-      FROM milk_records
-      WHERE deleted=0 AND owner_id=? AND record_date BETWEEN date(?,'-6 day') AND ?
-      GROUP BY record_date ORDER BY record_date ASC
-    """, (owner_id, t, t))
-    rev_list = [float(d["litres"] or 0.0) * fp["price"] for d in days if float(d["litres"] or 0.0) > 0]
-    avg7_rev = round(sum(rev_list) / len(rev_list), 2) if rev_list else 0.0
-
-    return {
-        "tot_litres": round(tot_l, 2),
-        "cows_recorded": n_cows,
-        "milk_per_cow": round(mlk_per_cow, 2),
-        "am_coverage": am_n,
-        "pm_coverage": pm_n,
-        "currency": fp["ccy"],
-        "revenue_today": revenue_today,
-        "avg7_revenue_day": avg7_rev
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('{{ url_for("service_worker") }}');
     }
+  </script>
+</body>
+</html>
+"""
 
-# -------- CSRF + throttling --------
-def get_csrf_token():
-    if "csrf_token" not in session:
-        session["csrf_token"] = secrets.token_hex(16)
-    return session["csrf_token"]
+TPL_HOME = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="grid" style="gap:1.5rem;">
+    <div class="card">
+      <h2>Add / Edit Milk</h2>
+      <form method="post" action="{{ url_for('add_milk') }}" class="grid grid-2">
+        <div>
+          <label>Date</label>
+          <input type="date" name="day" value="{{ today }}">
+        </div>
+        <div>
+          <label>Cow (optional)</label>
+          <input name="cow" placeholder="e.g. #12">
+        </div>
+        <div>
+          <label>AM litres</label>
+          <input type="number" step="0.01" name="am_litres" value="0">
+        </div>
+        <div>
+          <label>PM litres</label>
+          <input type="number" step="0.01" name="pm_litres" value="0">
+        </div>
+        <div>
+          <label>Tags (comma separated)</label>
+          <input name="tags" placeholder="e.g. freshened, mastitis, high-yield">
+        </div>
+        <div>
+          <label>Notes</label>
+          <input name="notes" placeholder="Optional notes">
+        </div>
+        <div>
+          <button class="btn" type="submit">Save</button>
+        </div>
+      </form>
+    </div>
 
-def require_csrf():
-    token = request.form.get("_csrf") or request.headers.get("X-CSRF-Token")
-    if not token or token != session.get("csrf_token"):
-        abort(400, description="CSRF token invalid")
+    <div class="card">
+      <h2>Recent Entries</h2>
+      {% if rows %}
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th><th>Cow</th><th>AM</th><th>PM</th><th>Total</th><th>Tags</th><th>Notes</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r.day }}</td>
+            <td>{{ r.cow or '' }}</td>
+            <td>{{ "%.2f"|format(r.am_litres) }}</td>
+            <td>{{ "%.2f"|format(r.pm_litres) }}</td>
+            <td>{{ "%.2f"|format(r.am_litres + r.pm_litres) }}</td>
+            <td>
+              {% for t in (r.tags or '').split(',') if t.strip() %}
+                <span class="tag">{{ t.strip() }}</span>
+              {% endfor %}
+            </td>
+            <td class="muted">{{ r.notes or '' }}</td>
+            <td class="row-actions">
+              <form method="post" action="{{ url_for('delete_milk', mid=r.id) }}">
+                <button class="btn danger" type="submit" onclick="return confirm('Delete entry?');">Delete</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <p class="muted">No entries yet. Add your first above.</p>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}
+"""
 
-_auth_hits = defaultdict(lambda: deque(maxlen=20))
-def throttle(ip, limit, per_seconds):
-    now = time.time()
-    q = _auth_hits[ip]
-    while q and now - q[0] > per_seconds:
-        q.popleft()
-    if len(q) >= limit:
-        return True
-    q.append(now); return False
+TPL_LOGIN = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="card" style="max-width:480px;">
+    <h2>Login</h2>
+    <form method="post" class="grid">
+      <div>
+        <label>Email</label>
+        <input name="email" type="email" required>
+      </div>
+      <div>
+        <label>Password</label>
+        <input name="password" type="password" required>
+      </div>
+      <div>
+        <button class="btn" type="submit">Login</button>
+      </div>
+    </form>
+    <p class="muted">No account? <a href="{{ url_for('register') }}">Register</a></p>
+  </div>
+{% endblock %}
+"""
 
-@app.before_request
-def guards():
-    # Rate limit login/register
-    if request.endpoint in {"login", "register"} and request.method == "POST":
-        ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "x").split(",")[0].strip()
-        if throttle(ip, limit=10, per_seconds=300):
-            abort(429, description="Too many attempts. Please wait a moment.")
-        # Optionally: skip CSRF for these two endpoints
-        return
+TPL_REGISTER = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="card" style="max-width:480px;">
+    <h2>Create account</h2>
+    <form method="post" class="grid">
+      <div>
+        <label>Email</label>
+        <input name="email" type="email" required>
+      </div>
+      <div>
+        <label>Password</label>
+        <input name="password" type="password" required>
+      </div>
+      <div>
+        <button class="btn" type="submit">Register</button>
+      </div>
+    </form>
+  </div>
+{% endblock %}
+"""
 
-    # CSRF for all other non-idempotent methods
-    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        if request.endpoint in {"service_worker", "manifest", "healthz"}:
-            return
-        require_csrf()
+TPL_PIVOT = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="card">
+    <h2>Pivot (Daily Totals)</h2>
+    {% if rows %}
+      <table>
+        <thead><tr><th>Date</th><th>AM</th><th>PM</th><th>Total</th></tr></thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r.day }}</td>
+            <td>{{ "%.2f"|format(r.am_sum or 0) }}</td>
+            <td>{{ "%.2f"|format(r.pm_sum or 0) }}</td>
+            <td>{{ "%.2f"|format((r.am_sum or 0) + (r.pm_sum or 0)) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No data.</p>
+    {% endif %}
+  </div>
+{% endblock %}
+"""
 
+TPL_ADMIN = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="card">
+    <h2>Admin — Claim Legacy Rows</h2>
+    <p class="muted">Rows with NULL owner_id will appear here. You can claim them.</p>
+    {% if rows %}
+      <form method="post" action="{{ url_for('admin_claim') }}">
+        <table>
+          <thead><tr><th>ID</th><th>Date</th><th>AM</th><th>PM</th><th>Cow</th><th>Tags</th><th>Notes</th><th>Owner</th><th>Claim?</th></tr></thead>
+          <tbody>
+            {% for r in rows %}
+            <tr>
+              <td>{{ r.id }}</td>
+              <td>{{ r.day }}</td>
+              <td>{{ r.am_litres }}</td>
+              <td>{{ r.pm_litres }}</td>
+              <td>{{ r.cow or '' }}</td>
+              <td>{{ r.tags or '' }}</td>
+              <td class="muted">{{ r.notes or '' }}</td>
+              <td>{{ r.owner_id if r.owner_id is not none else 'NULL' }}</td>
+              <td><input type="checkbox" name="claim_ids" value="{{ r.id }}"></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <p><button class="btn" type="submit">Claim Selected</button></p>
+      </form>
+    {% else %}
+      <p class="muted">No legacy rows to claim.</p>
+    {% endif %}
+  </div>
+{% endblock %}
+"""
 
-# -------- Email/Password Auth --------
-@app.route("/login", methods=["GET","POST"])
+# Wire base layout for string templates
+app.jinja_loader.mapping = {"base.html": TPL_BASE}
+
+# -----------------------------------------------------------------------------
+# Auth routes
+# -----------------------------------------------------------------------------
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        if not email or not password:
+            flash("Email and password are required.", "err")
+            return render_template_string(TPL_REGISTER)
+
+        existing = query_one("SELECT 1 FROM users WHERE email=?", (email,))
+        if existing:
+            flash("Email already registered.", "err")
+            return render_template_string(TPL_REGISTER)
+
+        count_row = query_one("SELECT COUNT(*) AS c FROM users")
+        is_admin = 1 if (count_row and count_row["c"] == 0) else 0
+        exec_sql(
+            "INSERT INTO users(email, password_hash, role, unit_pref, is_admin) VALUES(?,?,?,?,?)",
+            (email, generate_password_hash(password), "user", "L", is_admin)
+        )
+        user_row = query_one("SELECT id, email, role, unit_pref, is_admin FROM users WHERE email=?", (email,))
+        login_user(User.from_row(user_row))
+        flash("Welcome to MilkLog!", "ok")
+        return redirect(url_for("index"))
+    return render_template_string(TPL_REGISTER)
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        password = request.form.get("password") or ""
-        row = query_one("SELECT id, email, password_hash, role, COALESCE(unit_pref,'L') AS unit_pref FROM users WHERE email=?", (email,))
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        row = query_one("SELECT id, email, password_hash, role, unit_pref, is_admin FROM users WHERE email=?", (email,))
         if row and check_password_hash(row["password_hash"], password):
-            login_user(User(row))
-            return redirect(url_for("home"))
-        flash("Invalid email or password", "error")
-    return render_template_string(TPL_LOGIN, base_css=BASE_CSS, get_csrf_token=get_csrf_token)
+            user = User(
+                id=row["id"], email=row["email"],
+                role=row["role"], unit_pref=row["unit_pref"], is_admin=bool(row["is_admin"])
+            )
+            login_user(user)
+            flash("Logged in.", "ok")
+            return redirect(url_for("index"))
+        flash("Invalid credentials.", "err")
+    return render_template_string(TPL_LOGIN)
 
-@app.route("/register", methods=["GET","POST"])
-def register():
-    any_user = query_one("SELECT id FROM users LIMIT 1")
-    default_role = "admin" if not any_user else "user"
-    if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        password = request.form.get("password") or ""
-        if not email or not password:
-            flash("Email and password required", "error")
-            return redirect(url_for("register"))
-        try:
-            exec_write("""
-              INSERT INTO users (email, password_hash, role, created_at)
-              VALUES (?, ?, ?, ?)
-            """, (email, generate_password_hash(password), default_role, datetime.utcnow().isoformat()))
-            row = query_one("SELECT id, email, role, COALESCE(unit_pref,'L') AS unit_pref FROM users WHERE email=?", (email,))
-            login_user(User(row))
-            flash("Account created.", "ok")
-            return redirect(url_for("home"))
-        except Exception as e:
-            flash(f"Registration failed: {e}", "error")
-            return redirect(url_for("register"))
-    return render_template_string(TPL_REGISTER, base_css=BASE_CSS, default_role=default_role, get_csrf_token=get_csrf_token)
-
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 @login_required
 def logout():
     logout_user()
+    flash("Logged out.", "ok")
     return redirect(url_for("login"))
 
-# -------- Google Sign-In routes --------
-@app.route("/login/google")
-def login_google():
-    redirect_uri = os.getenv("OAUTH_REDIRECT_URI") or url_for("auth_google_callback", _external=True)
-    return oauth.google.authorize_redirect(redirect_uri)
-
-@app.route("/auth/google/callback")
-def auth_google_callback():
-    try:
-        token = oauth.google.authorize_access_token()
-        userinfo = token.get("userinfo")
-        if not userinfo:
-            resp = oauth.google.get("userinfo")
-            userinfo = resp.json()
-        g_sub = userinfo.get("sub")
-        email = (userinfo.get("email") or "").lower()
-        name = userinfo.get("name") or ""
-        picture = userinfo.get("picture") or ""
-
-        if not g_sub or not email:
-            flash("Google login failed: missing identity claims.", "error")
-            return redirect(url_for("login"))
-
-        # Prefer linking by Google subject
-        row = query_one("""
-            SELECT id, email, role, COALESCE(unit_pref,'L') AS unit_pref
-            FROM users WHERE google_sub=?
-        """, (g_sub,))
-
-        if not row:
-            # If account exists by email, link it
-            row = query_one("""
-                SELECT id, email, role, COALESCE(unit_pref,'L') AS unit_pref
-                FROM users WHERE email=?
-            """, (email,))
-            if row:
-                exec_write("UPDATE users SET google_sub=?, name=?, avatar=? WHERE id=?",
-                           (g_sub, name, picture, row["id"]))
-            else:
-                # Create new user
-                any_user = query_one("SELECT id FROM users LIMIT 1")
-                role = "admin" if not any_user else "user"
-                dummy_pw = generate_password_hash(secrets.token_hex(16))
-                exec_write("""
-                    INSERT INTO users (email, password_hash, role, created_at, google_sub, name, avatar)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (email, dummy_pw, role, datetime.utcnow().isoformat(), g_sub, name, picture))
-                row = query_one("""
-                    SELECT id, email, role, COALESCE(unit_pref,'L') AS unit_pref
-                    FROM users WHERE google_sub=?
-                """, (g_sub,))
-
-        login_user(User(row))
-        flash("Signed in with Google.", "ok")
-        return redirect(url_for("home"))
-    except Exception as e:
-        flash(f"Google login error: {e}", "error")
-        return redirect(url_for("login"))
-
-# -------- Finance settings (price/L & currency) --------
-@app.route("/settings/finance", methods=["POST"])
-@login_required
-def save_finance():
-    require_csrf()
-    try:
-        price = float(request.form.get("milk_price_per_litre") or 0)
-        ccy   = (request.form.get("currency") or "€").strip()[:3]
-        exec_write("UPDATE users SET milk_price_per_litre=?, currency=? WHERE id=?",
-                   (price, ccy, current_user.id))
-        flash("Finance settings saved.", "ok")
-    except Exception as e:
-        flash(f"Save failed: {e}", "error")
-    return redirect(url_for("home"))
-
-# -------- Core data ops --------
-def add_record(cow_number, litres, record_date_str, session_val, note, tags, owner_id):
-    _ = date.fromisoformat(record_date_str)  # validate
-    if session_val not in ("AM","PM"):
-        session_val = "AM"
-    exec_write("""
-      INSERT INTO milk_records (cow_number, litres, record_date, session, note, tags, owner_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (cow_number.strip(), float(litres), record_date_str, session_val,
-          (note or "").strip() or None, (tags or "").strip() or None,
-          owner_id, datetime.utcnow().isoformat()))
-
-def update_record(rec_id, litres, session_val, note, tags, owner_id):
-    fields, args = [], []
-    if litres is not None:
-        fields.append("litres=?"); args.append(float(litres))
-    if session_val:
-        fields.append("session=?"); args.append(session_val if session_val in ("AM","PM") else "AM")
-    fields += ["note=?", "tags=?", "edited_at=?"]
-    args += [(note or "").strip() or None, (tags or "").strip() or None, datetime.utcnow().isoformat(), owner_id, rec_id]
-    exec_write(f"UPDATE milk_records SET {', '.join(fields)} WHERE owner_id=? AND id=?", tuple(args))
-
-def soft_delete_record(rec_id, owner_id):
-    exec_write("UPDATE milk_records SET deleted=1, edited_at=? WHERE owner_id=? AND id=?",
-               (datetime.utcnow().isoformat(), owner_id, rec_id))
-
-def restore_record(rec_id, owner_id):
-    exec_write("UPDATE milk_records SET deleted=0, edited_at=? WHERE owner_id=? AND id=?",
-               (datetime.utcnow().isoformat(), owner_id, rec_id))
-
-# -------- PWA bits --------
-@app.route("/manifest.json")
-def manifest():
-    data = {
-        "name":"Milk Log","short_name":"MilkLog","start_url":"/","display":"standalone",
-        "background_color":"#0f172a","theme_color":"#22c55e",
-        "icons":[{"src":"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='192' height='192'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='55%' font-size='100' text-anchor='middle' fill='%2322c55e'>🐄</text></svg>","sizes":"192x192","type":"image/svg+xml"}]
-    }
-    return Response(json.dumps(data), mimetype="application/json")
-
-@app.route("/sw.js")
-def service_worker():
-    js = """
-const CACHE = "milklog-v44-static-only";
-const STATIC_ASSETS = [
-  "/manifest.json"
-];
-
-// Install: pre-cache just static assets
-self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(STATIC_ASSETS))
-  );
-});
-
-// Activate: clean old caches
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.map(k => (k === CACHE ? null : caches.delete(k))))
-    )
-  );
-});
-
-// Fetch: only GET requests to STATIC_ASSETS are cached.
-// Never cache HTML pages or POST/PUT/PATCH/DELETE.
-self.addEventListener("fetch", (event) => {
-  const req = event.request;
-  if (req.method !== "GET") return;
-
-  const url = new URL(req.url);
-  const isStatic = STATIC_ASSETS.includes(url.pathname);
-
-  if (!isStatic) return; // Let the network handle dynamic pages with CSRF tokens
-
-  event.respondWith(
-    caches.match(req).then((cached) => {
-      if (cached) return cached;
-      return fetch(req).then((res) => {
-        const resClone = res.clone();
-        caches.open(CACHE).then((cache) => cache.put(req, resClone));
-        return res;
-      });
-    })
-  );
-});
-"""
-    return Response(js, mimetype="application/javascript")
-
-
-# -------- Views --------
+# -----------------------------------------------------------------------------
+# App routes
+# -----------------------------------------------------------------------------
 @app.route("/")
 @login_required
-def home():
-    k = kpis_for_home(current_owner_id())
-    return render_template_string(TPL_HOME,
-        base_css=BASE_CSS, k=k,
-        to_display_litres=to_display_litres, unit_pref_for=unit_pref_for,
-        get_csrf_token=get_csrf_token
-    )
-
-@app.route("/new")
-@login_required
-def new_record_screen():
-    return render_template_string(TPL_NEW, base_css=BASE_CSS, today=today_str(), get_csrf_token=get_csrf_token)
+def index():
+    rows = query_all("""
+        SELECT id, day, am_litres, pm_litres, cow, tags, notes
+        FROM milk
+        WHERE deleted=0 AND owner_id=?
+        ORDER BY day DESC, id DESC
+        LIMIT 200
+    """, (current_user.id,))
+    ctx: Dict[str, Any] = {"rows": rows, "today": date.today().isoformat()}
+    return render_template_string(TPL_HOME, **ctx)
 
 @app.route("/add", methods=["POST"])
 @login_required
-def add():
-    cow = (request.form.get("cow_number") or "").strip()
-    litres = (request.form.get("litres") or "").strip()
-    session_val = (request.form.get("session") or "AM").strip()
-    note = (request.form.get("note") or "").strip()
+def add_milk():
+    day_str = (request.form.get("day") or date.today().isoformat()).strip()
+    try:
+        _ = datetime.strptime(day_str, "%Y-%m-%d").date()
+    except Exception:
+        flash("Invalid date.", "err")
+        return redirect(url_for("index"))
+
+    def to_float(x, default=0.0):
+        try: return float(x)
+        except Exception: return default
+
+    am = to_float(request.form.get("am_litres", "0"))
+    pm = to_float(request.form.get("pm_litres", "0"))
+    cow = (request.form.get("cow") or "").strip()
     tags = (request.form.get("tags") or "").strip()
-    record_date_str = (request.form.get("record_date") or today_str()).strip()
-    if not cow:
-        flash("Cow number is required", "error")
-        return redirect(url_for("new_record_screen"))
-    try:
-        litres_val = float(litres)
-        if litres_val < 0: raise ValueError
-    except ValueError:
-        flash("Litres must be a non-negative number", "error")
-        return redirect(url_for("new_record_screen"))
-    try:
-        add_record(cow, litres_val, record_date_str, session_val, note, tags, current_owner_id())
-    except ValueError:
-        flash("Bad date. Use YYYY-MM-DD.", "error")
-        return redirect(url_for("new_record_screen"))
-    except Exception as e:
-        flash(f"Error saving: {e}", "error")
-        return redirect(url_for("new_record_screen"))
-    flash("Saved!", "ok")
-    return redirect(url_for("new_record_screen"))
+    notes = (request.form.get("notes") or "").strip()
 
-@app.route("/records")
+    exec_sql("""
+        INSERT INTO milk(owner_id, day, am_litres, pm_litres, cow, tags, notes, updated_at)
+        VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+    """, (current_user.id, day_str, am, pm, cow, tags, notes))
+    flash("Saved.", "ok")
+    return redirect(url_for("index"))
+
+@app.route("/delete/<int:mid>", methods=["POST"])
 @login_required
-def records_screen():
-    try:
-        last = int(request.args.get("last", "7"))
-    except ValueError:
-        last = 7
-    last = max(1, min(last, 90))
-    dates_desc = query("""
-        SELECT DISTINCT record_date
-        FROM milk_records
+def delete_milk(mid: int):
+    row = query_one("SELECT id FROM milk WHERE id=? AND owner_id=? AND deleted=0", (mid, current_user.id))
+    if not row:
+        flash("Not found.", "err")
+        return redirect(url_for("index"))
+    exec_sql("UPDATE milk SET deleted=1, updated_at=CURRENT_TIMESTAMP WHERE id=?", (mid,))
+    flash("Deleted.", "ok")
+    return redirect(url_for("index"))
+
+@app.route("/pivot")
+@login_required
+def pivot():
+    rows = query_all("""
+        SELECT day,
+               SUM(am_litres) AS am_sum,
+               SUM(pm_litres) AS pm_sum
+        FROM milk
         WHERE deleted=0 AND owner_id=?
-        ORDER BY record_date DESC
-        LIMIT ?
-    """, (current_owner_id(), last))
-    dates = list(reversed([r["record_date"] for r in dates_desc]))
-    sessions = ["AM","PM"]
-    rows=[]
-    if dates:
-        placeholders = ",".join("?" * len(dates))
-        data = query(f"""
-          SELECT cow_number, record_date, session, SUM(litres) AS litres
-          FROM milk_records
-          WHERE deleted=0 AND owner_id=? AND record_date IN ({placeholders})
-          GROUP BY cow_number, record_date, session
-        """, (current_owner_id(), *dates))
-        by_cow={}
-        for r in data:
-            by_cow.setdefault(r["cow_number"],{})
-            by_cow[r["cow_number"]][(r["record_date"], r["session"])] = float(r["litres"] or 0)
-        def cow_key(c):
-            try: return (0,int(c))
-            except: return (1,c)
-        for cow in sorted(by_cow.keys(), key=cow_key):
-            vals=[]; tot=0.0
-            for d in dates:
-                for s in sessions:
-                    v = by_cow[cow].get((d,s),0.0)
-                    vals.append(round(v,2)); tot+=v
-            rows.append({"cow":cow,"cells":vals,"total":round(tot,2)})
-    return render_template_string(TPL_RECORDS,
-        base_css=BASE_CSS, dates=dates, sessions=sessions, rows=rows,
-        last=last, get_csrf_token=get_csrf_token
-    )
-
-@app.route("/recent")
-@login_required
-def recent_screen():
-    try:
-        limit = int(request.args.get("limit","150"))
-    except ValueError:
-        limit = 150
-    limit = max(1, min(limit, 500))
-    rows = query("""
-      SELECT id, cow_number, litres, record_date, session, note, tags, created_at, edited_at, deleted
-      FROM milk_records
-      WHERE owner_id=?
-      ORDER BY id DESC
-      LIMIT ?
-    """, (current_owner_id(), limit))
-    msg = request.args.get("msg")
-    return render_template_string(TPL_RECENT, base_css=BASE_CSS, rows=rows, limit=limit, msg=msg, get_csrf_token=get_csrf_token)
-
-@app.route("/update/<int:rec_id>", methods=["POST"])
-@login_required
-def update(rec_id):
-    litres = request.form.get("litres")
-    session_val = request.form.get("session")
-    note = request.form.get("note","")
-    tags = request.form.get("tags","")
-    try:
-        litres_val = float(litres) if litres is not None else None
-        update_record(rec_id, litres_val, session_val, note, tags, current_owner_id())
-        return redirect(url_for("recent_screen", msg="Updated."))
-    except Exception as e:
-        return redirect(url_for("recent_screen", msg=f"Update failed: {e}"))
-
-@app.route("/delete/<int:rec_id>", methods=["POST"])
-@login_required
-def delete(rec_id):
-    soft_delete_record(rec_id, current_owner_id())
-    return redirect(url_for("recent_screen", msg="Deleted 1 entry (soft delete)."))
-
-@app.route("/restore/<int:rec_id>", methods=["POST"])
-@login_required
-def restore(rec_id):
-    restore_record(rec_id, current_owner_id())
-    return redirect(url_for("recent_screen", msg="Restored 1 entry."))
-
-# ----- CSV Import/Export -----
-@app.route("/import", methods=["GET", "POST"])
-@login_required
-def import_csv():
-    info=None
-    if request.method=="POST" and "file" in request.files:
-        f = request.files["file"]
-        try:
-            text = f.stream.read().decode("utf-8")
-            reader = csv.DictReader(io.StringIO(text))
-            count=0
-            for row in reader:
-                try:
-                    add_record(
-                        row["cow_number"], float(row["litres"]),
-                        row["record_date"], row.get("session","AM"),
-                        row.get("note","") or "", row.get("tags","") or "",
-                        current_owner_id()
-                    )
-                    count+=1
-                except Exception:
-                    pass
-            info=f"Imported {count} records."
-        except Exception as e:
-            info=f"Import failed: {e}"
-    return render_template_string(TPL_IMPORT, base_css=BASE_CSS, info=info, get_csrf_token=get_csrf_token)
+        GROUP BY day
+        ORDER BY day DESC
+        LIMIT 365
+    """, (current_user.id,))
+    return render_template_string(TPL_PIVOT, rows=rows)
 
 @app.route("/export.csv")
 @login_required
 def export_csv():
-    rows = query("""
-      SELECT id, cow_number, litres, record_date, session, note, tags, created_at, edited_at, deleted
-      FROM milk_records
-      WHERE owner_id=?
-      ORDER BY record_date DESC, id DESC
-    """, (current_owner_id(),))
-    out = io.StringIO(); w = csv.writer(out)
-    headers = ["id","cow_number","litres","record_date","session","note","tags","created_at","edited_at","deleted"]
-    w.writerow(headers)
-    for r in rows: w.writerow([r[h] for h in headers])
-    out.seek(0)
-    return send_file(io.BytesIO(out.read().encode("utf-8")), as_attachment=True,
-                     download_name="milk_records.csv", mimetype="text/csv")
+    def generate():
+        yield "id,day,am_litres,pm_litres,cow,tags,notes,created_at,updated_at\n"
+        with closing(get_db()) as conn:
+            cur = conn.execute("""
+                SELECT id, day, am_litres, pm_litres, cow, tags, notes, created_at, updated_at
+                FROM milk
+                WHERE deleted=0 AND owner_id=?
+                ORDER BY day ASC, id ASC
+            """, (current_user.id,))
+            for r in cur:
+                row = [
+                    r["id"],
+                    r["day"],
+                    f"{r['am_litres']:.2f}",
+                    f"{r['pm_litres']:.2f}",
+                    (r["cow"] or "").replace(",", " "),
+                    (r["tags"] or "").replace(",", " "),
+                    (r["notes"] or "").replace("\n", " ").replace(",", " "),
+                    r["created_at"],
+                    r["updated_at"] or "",
+                ]
+                yield ",".join(map(str, row)) + "\n"
+    headers = {"Content-Disposition": f'attachment; filename="milk_export_{date.today().isoformat()}.csv"'}
+    return Response(generate(), mimetype="text/csv", headers=headers)
 
-@app.route("/export.xlsx")
+# -----------------------------------------------------------------------------
+# Admin — claim legacy rows
+# -----------------------------------------------------------------------------
+@app.route("/admin")
 @login_required
-def export_excel():
-    if Workbook is None:
-        return "Excel export not available (openpyxl not installed).", 503
-    data = query("""
-      SELECT id, cow_number, litres, record_date, session, note, tags, created_at
-      FROM milk_records
-      WHERE owner_id=? AND deleted=0
-      ORDER BY record_date ASC, cow_number ASC, id ASC
-    """, (current_owner_id(),))
-    wb = Workbook()
-    ws = wb.active; ws.title = "Raw Records"
-    ws.append(["ID","Cow #","Litres","Date","Session","Note","Tags","Saved (UTC)"])
-    for r in data:
-        ws.append([r["id"], r["cow_number"], r["litres"], r["record_date"], r["session"], r["note"] or "", r["tags"] or "", r["created_at"]])
-    for col, wdt in zip("ABCDEFGH", [8,10,10,12,10,25,25,25]): ws.column_dimensions[col].width = wdt
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return send_file(bio, as_attachment=True, download_name="milk-records.xlsx",
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+def admin():
+    if not getattr(current_user, "is_admin", False):
+        flash("Admin only.", "err")
+        return redirect(url_for("index"))
+    rows = query_all("""
+        SELECT *
+        FROM milk
+        WHERE owner_id IS NULL OR owner_id=0
+        ORDER BY created_at DESC
+        LIMIT 500
+    """)
+    return render_template_string(TPL_ADMIN, rows=rows)
+
+@app.route("/admin/claim", methods=["POST"])
+@login_required
+def admin_claim():
+    if not getattr(current_user, "is_admin", False):
+        flash("Admin only.", "err")
+        return redirect(url_for("index"))
+    ids = [x for x in request.form.getlist("claim_ids") if x.isdigit()]
+    if not ids:
+        flash("Nothing selected.", "err")
+        return redirect(url_for("admin"))
+    qmarks = ",".join("?" for _ in ids)
+    with closing(get_db()) as conn, conn:
+        conn.execute(
+            f"UPDATE milk SET owner_id=?, updated_at=CURRENT_TIMESTAMP WHERE id IN ({qmarks})",
+            (current_user.id, *map(int, ids))
+        )
+    flash(f"Claimed {len(ids)} rows.", "ok")
+    return redirect(url_for("admin"))
+
+# -----------------------------------------------------------------------------
+# PWA / health
+# -----------------------------------------------------------------------------
+@app.route("/manifest.webmanifest")
+def manifest():
+    return jsonify({
+        "name": "MilkLog",
+        "short_name": "MilkLog",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0b1220",
+        "theme_color": "#0f172a",
+        "icons": [
+            {"src": "/static/icon-192.png", "type": "image/png", "sizes": "192x192"},
+            {"src": "/static/icon-512.png", "type": "image/png", "sizes": "512x512"}
+        ]
+    })
+
+@app.route("/sw.js")
+def service_worker():
+    resp = Response(
+        """
+self.addEventListener('install', event => { self.skipWaiting(); });
+self.addEventListener('activate', event => { event.waitUntil(clients.claim()); });
+self.addEventListener('fetch', event => {
+  event.respondWith(fetch(event.request).catch(() => new Response('', {status: 200})));
+});
+        """,
+        mimetype="application/javascript",
+    )
+    resp.headers["Service-Worker-Allowed"] = "/"
+    return resp
 
 @app.route("/healthz")
 def healthz():
-    return "ok", 200
+    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
 
-# -------- Styles & Templates --------
-BASE_CSS = """
-:root{
-  --bg:#0b1220; --panel:#0f172a; --border:#223044; --text:#e5e7eb;
-  --muted:#9aa5b1; --accent:#22c55e; --accent-fore:#07220e;
-  --radius:18px; --shadow:0 14px 40px rgba(0,0,0,.35);
-}
-*{box-sizing:border-box}
-body{margin:0;background:radial-gradient(1200px 600px at 10% -10%, #0a1222 0, #0b1629 30%, #0f172a 70%), #0f172a;
-     color:var(--text);font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial}
-.wrap{max-width:880px;margin:0 auto;padding:22px}
-.top{display:flex;align-items:center;justify-content:space-between;margin:6px 2px 18px}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{width:40px;height:40px}
-.title{font-weight:900;letter-spacing:.2px;font-size:22px}
-.kicker{color:var(--muted);font-size:12px;margin-top:-6px}
-.card{background:linear-gradient(180deg,#0c1324,#111a2f);border:1px solid var(--border);
-      border-radius:var(--radius);padding:18px 18px 16px;box-shadow:var(--shadow);margin-bottom:16px}
-.menu{display:grid;gap:12px}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;background:var(--accent);color:var(--accent-fore);
-     font-weight:800;padding:12px 16px;border:none;border-radius:14px;cursor:pointer;text-decoration:none;text-align:center}
-.btn.secondary{background:#0b1220;color:var(--text);border:1px solid var(--border)}
-.btn.warn{background:#ef4444;color:#fff}
-.field{display:grid;gap:6px}
-label{font-size:13px;color:var(--muted)}
-input,select,textarea{background:#0b1220;border:1px solid var(--border);color:var(--text);padding:12px;border-radius:12px;font-size:16px;width:100%}
-.grid2{display:grid;gap:12px;grid-template-columns:1fr}
-@media(min-width:620px){.grid2{grid-template-columns:1fr 1fr}}
-table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px;overflow-x:auto;display:block}
-thead, tbody { display: table; width: 100%; }
-th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
-th{color:var(--muted);font-weight:600;background:#0b1220;position:sticky;top:0}
-tr:hover td{background:rgba(120,190,255,.06)}
-.hint{color:var(--muted);font-size:12px;text-align:center;margin-top:12px}
-.badge{display:inline-block;background:#0b1220;border:1px solid var(--border);color:var(--text);
-       border-radius:12px;padding:4px 10px;font-size:12px}
-.subtle{color:var(--muted);font-size:12px;text-align:center;margin-top:14px}
-.header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.hero{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px}
-.stat{background:#0b1220;border:1px dashed #1b2a3e;border-radius:12px;padding:12px}
-.stat .big{font-weight:900;font-size:22px}
-.flash{margin:8px 0;padding:10px;border-radius:10px}
-.flash.ok{background:#0e3821;border:1px solid #1c7f4b}
-.flash.error{background:#3b0e0e;border:1px solid #7f1d1d}
-small.muted{color:var(--muted)}
-a.link{color:#86efac;text-decoration:underline}
-"""
-
-TPL_LOGIN = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Login</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="card" style="max-width:520px;margin:40px auto">
-      <div class="top" style="margin-bottom:8px">
-        <div class="brand">
-          <svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg>
-          <div class="title">Milk Log</div>
-        </div>
-      </div>
-      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-
-      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 14px">
-        <a class="btn" style="background:#ffffff;color:#111;border:1px solid #ccc"
-           href="{{ url_for('login_google') }}">
-          <svg width="18" height="18" viewBox="0 0 48 48" style="margin-right:6px">
-            <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.8 32.6 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3 0 5.7 1.1 7.8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 19-8.9 19-20c0-1.2-.1-2.3-.4-3.5z"/>
-            <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.5 16.3 18.9 13 24 13c3 0 5.7 1.1 7.8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 16.2 4 9.5 8.3 6.3 14.7z"/>
-            <path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.5-5.2l-6.2-5.2C29.3 36 26.8 37 24 37c-5.2 0-9.6-3.4-11.2-8.1l-6.6 5.1C9.4 39.7 16.1 44 24 44z"/>
-            <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1 2.9-3.2 5.2-6 6.5l6.2 5.2C37.1 41.9 43 36.9 43 28c0-2.5-.5-4.8-1.4-7.5z"/>
-          </svg>
-          Continue with Google
-        </a>
-      </div>
-
-      <form method="POST" class="grid2">
-        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
-        <div class="field"><label>Email</label><input name="email" type="email" required></div>
-        <div class="field"><label>Password</label><input name="password" type="password" required></div>
-        <div><button class="btn" type="submit">Sign in</button></div>
-      </form>
-      <div class="subtle" style="margin-top:10px">No account? <a class="link" href="{{ url_for('register') }}">Create one</a>.</div>
-    </div>
-  </div>
-</body></html>
-"""
-
-TPL_REGISTER = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Register</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="card" style="max-width:520px;margin:40px auto">
-      <div class="top" style="margin-bottom:8px">
-        <div class="brand">
-          <svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg>
-          <div class="title">Create Account</div>
-        </div>
-        <span class="badge">{{ 'First user will be admin' if default_role=='admin' else 'Role: user' }}</span>
-      </div>
-      {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-      <form method="POST" class="grid2">
-        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
-        <div class="field"><label>Email</label><input name="email" type="email" required></div>
-        <div class="field"><label>Password</label><input name="password" type="password" required></div>
-        <div><button class="btn" type="submit">Create account</button></div>
-      </form>
-      <div class="subtle" style="margin-top:10px">Already have an account? <a class="link" href="{{ url_for('login') }}">Sign in</a>.</div>
-    </div>
-  </div>
-</body></html>
-"""
-
-TPL_HOME = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="manifest" href="/manifest.json">
-<script>navigator.serviceWorker?.register('/sw.js');</script>
-<title>Milk Log</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand">
-        <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.7"/>
-          <circle cx="9" cy="11" r="1.6" fill="#22c55e"/><circle cx="15" cy="11" r="1.6" fill="#22c55e"/>
-        </svg>
-        <div>
-          <div class="title">Milk Log</div>
-          <div class="kicker">Fast, clean milk recording</div>
-        </div>
-      </div>
-      <span class="badge">Finance: price/L</span>
-    </div>
-
-    <div class="hero">
-      {% set v, u = to_display_litres(k.tot_litres) %}
-      <div class="stat"><div class="big">{{ v }} {{ u }}</div><div>Total today</div></div>
-
-      {% set v2, u2 = to_display_litres(k.milk_per_cow) %}
-      <div class="stat"><div class="big">{{ v2 }} {{ u2 }}</div><div>Milk per cow</div></div>
-
-      <div class="stat"><div class="big">{{ k.currency }} {{ '%.2f' % k.revenue_today }}</div><div>Revenue today</div></div>
-    </div>
-
-    <div class="card">
-      <div style="font-size:20px;font-weight:800;margin-bottom:10px">Main menu</div>
-      <div class="menu">
-        <a class="btn" href="{{ url_for('records_screen') }}">Cow Records</a>
-        <a class="btn secondary" href="{{ url_for('new_record_screen') }}">New Recording</a>
-        <a class="btn secondary" href="{{ url_for('recent_screen') }}">Recent Entries</a>
-        <a class="btn secondary" href="{{ url_for('import_csv') }}">Import CSV</a>
-        <a class="btn secondary" href="{{ url_for('export_csv') }}">Export CSV</a>
-        <a class="btn secondary" href="{{ url_for('export_excel') }}">Export Excel</a>
-        <a class="btn warn" href="{{ url_for('logout') }}">Logout</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <div style="font-size:18px;font-weight:800;margin-bottom:6px">Finance</div>
-      <form method="POST" action="{{ url_for('save_finance') }}" class="grid2">
-        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
-        <div class="field">
-          <label>Milk price ({{ k.currency }}/L)</label>
-          <input type="number" step="0.001" name="milk_price_per_litre" placeholder="e.g. 0.52">
-        </div>
-        <div class="field">
-          <label>Currency (symbol or ISO)</label>
-          <input name="currency" maxlength="3" placeholder="€">
-        </div>
-        <div><button class="btn secondary" type="submit">Save</button></div>
-      </form>
-      <div class="hint">7-day avg revenue/day: <strong>{{ k.currency }} {{ '%.2f' % k.avg7_revenue_day }}</strong></div>
-    </div>
-
-    {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-    <div class="subtle">Set your price per litre to see revenue figures on this dashboard.</div>
-  </div>
-</body></html>
-"""
-
-TPL_NEW = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>New Recording</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">New Recording</div></div>
-      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
-    </div>
-    {% with msgs = get_flashed_messages(with_categories=true) %}{% if msgs %}{% for cat,m in msgs %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-
-    <div class="card">
-      <form method="POST" action="{{ url_for('add') }}" class="grid2">
-        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
-        <div class="field"><label>Cow number</label><input name="cow_number" required></div>
-        <div class="field"><label>Litres</label><input name="litres" type="number" step="0.01" min="0" required></div>
-        <div class="field"><label>Date</label><input id="record_date" name="record_date" type="date" value="{{ today }}" required></div>
-        <div class="field"><label>Session</label>
-          <select name="session"><option>AM</option><option>PM</option></select>
-        </div>
-        <div class="field"><label>Tags (comma)</label><input name="tags" placeholder="fresh, high"></div>
-        <div class="field" style="grid-column:1/-1"><label>Note</label><textarea name="note" rows="3"></textarea></div>
-        <div style="grid-column:1/-1"><button class="btn" type="submit">Save</button></div>
-      </form>
-    </div>
-  </div>
-</body></html>
-"""
-
-TPL_RECORDS = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cow Records</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">Cow Records</div></div>
-      <div class="header-actions">
-        <a class="btn secondary" href="{{ url_for('records_screen', last=(request.args.get('last',7)|int - 3 if request.args.get('last') else 4)) }}">-3 days</a>
-        <span class="badge">Window: {{ last }} days</span>
-        <a class="btn secondary" href="{{ url_for('records_screen', last=(request.args.get('last',7)|int + 3 if request.args.get('last') else 10)) }}">+3 days</a>
-        <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
-      </div>
-    </div>
-    <div class="card">
-      <table>
-        <thead>
-          <tr><th>Cow #</th>{% for d in dates %}{% for s in sessions %}<th>{{ d }} {{ s }}</th>{% endfor %}{% endfor %}<th>Total</th></tr>
-        </thead>
-        <tbody>
-          {% for r in rows %}
-          <tr><td>{{ r.cow }}</td>{% for v in r.cells %}<td>{{ '%.2f'|format(v) }}</td>{% endfor %}<td><strong>{{ '%.2f'|format(r.total) }}</strong></td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% if not rows %}<div class="hint">No data yet for this window.</div>{% endif %}
-    </div>
-  </div>
-</body></html>
-"""
-
-TPL_RECENT = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Recent Entries</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">Recent Entries</div></div>
-      <a class="btn secondary" href="{{ url_for('home') }}">Back</a>
-    </div>
-    {% if msg %}<div class="flash ok">{{ msg }}</div>{% endif %}
-    <div class="card">
-      <table>
-        <thead><tr><th>ID</th><th>Cow</th><th>Litres</th><th>Date</th><th>Session</th><th>Tags</th><th>Note</th><th>Created</th><th>Edited</th><th>Actions</th></tr></thead>
-        <tbody>
-        {% for r in rows %}
-          <tr>
-            <td>{{ r['id'] }}</td>
-            <td>{{ r['cow_number'] }}</td>
-            <td>
-              <form method="POST" action="{{ url_for('update', rec_id=r['id']) }}" style="display:flex;gap:6px;align-items:center">
-                <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
-                <input name="litres" type="number" step="0.01" min="0" value="{{ '%.2f'|format(r['litres']) }}" style="width:90px">
-            </td>
-            <td>{{ r['record_date'] }}</td>
-            <td>
-                <select name="session"><option {% if r['session']=='AM' %}selected{% endif %}>AM</option><option {% if r['session']=='PM' %}selected{% endif %}>PM</option></select>
-            </td>
-            <td><input name="tags" value="{{ r['tags'] or '' }}" style="width:140px"></td>
-            <td><input name="note" value="{{ r['note'] or '' }}" style="width:180px"></td>
-            <td><small class="muted">{{ r['created_at'][:16] }}</small></td>
-            <td><small class="muted">{{ (r['edited_at'] or '')[:16] }}</small></td>
-            <td style="display:flex;gap:6px">
-                <button class="btn secondary" type="submit">Update</button></form>
-                {% if r['deleted']==0 %}
-                <form method="POST" action="{{ url_for('delete', rec_id=r['id']) }}"><input type="hidden" name="_csrf" value="{{ get_csrf_token() }}"><button class="btn warn" type="submit">Delete</button></form>
-                {% else %}
-                <form method="POST" action="{{ url_for('restore', rec_id=r['id']) }}"><input type="hidden" name="_csrf" value="{{ get_csrf_token() }}"><button class="btn" type="submit">Restore</button></form>
-                {% endif %}
-            </td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-      {% if not rows %}<div class="hint">No entries yet.</div>{% endif %}
-    </div>
-  </div>
-</body></html>
-"""
-
-TPL_IMPORT = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Import CSV</title><style>{{ base_css }}</style></head><body>
-  <div class="wrap">
-    <div class="top"><div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none"><path d="M4 10c0-4 3-7 8-7s8 3 8 7v6a3 3 0 0 1-3 3h-2l-1 2h-4l-1-2H7a3 3 0 0 1-3-3v-6Z" stroke="#22c55e" stroke-width="1.6"/></svg><div class="title">Import CSV</div></div><a class="btn secondary" href="{{ url_for('home') }}">Back</a></div>
-    {% if info %}<div class="flash ok">{{ info }}</div>{% endif %}
-    <div class="card">
-      <form method="POST" enctype="multipart/form-data">
-        <input type="hidden" name="_csrf" value="{{ get_csrf_token() }}">
-        <div class="field"><label>CSV file</label><input type="file" name="file" accept=".csv" required></div>
-        <button class="btn" type="submit">Upload & Import</button>
-      </form>
-      <div class="hint">Headers: cow_number, litres, record_date, session, note, tags</div>
-    </div>
-  </div>
-</body></html>
-"""
-
-# -------- Local run --------
+# -----------------------------------------------------------------------------
+# WSGI entry
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    app.config.update(SESSION_COOKIE_SAMESITE="Lax")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
