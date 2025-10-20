@@ -1,14 +1,4 @@
-# app.py
-# Milk Log v4 — Single-file Flask app for Render (gunicorn app:app)
-# Features:
-# - Users: register/login/logout (Flask-Login, hashed passwords)
-# - First user becomes admin
-# - owner_id on milk rows; all queries scoped to current_user
-# - Add/Delete milk entries, tags/notes, per-day pivot, CSV export
-# - Admin page to claim legacy rows missing owner_id
-# - PWA: manifest + service worker
-# - SQLite with WAL; idempotent schema bootstrap/migrations
-
+# app.py — Milk Log v4 (v2 loader + SW fix)
 import os
 import csv
 import sqlite3
@@ -25,6 +15,7 @@ from flask_login import (
     logout_user, current_user
 )
 from werkzeug.security import generate_password_hash, check_password_hash
+from jinja2 import DictLoader  # <-- proper loader
 
 # -----------------------------------------------------------------------------
 # App / Config
@@ -118,41 +109,6 @@ def init_db() -> None:
 
 # Call at import so workers are ready
 init_db()
-
-# -----------------------------------------------------------------------------
-# User model / loader
-# -----------------------------------------------------------------------------
-class User(UserMixin):
-    def __init__(self, id: int, email: str, role: str = "user",
-                 unit_pref: str = "L", is_admin: bool = False):
-        self.id = id
-        self.email = email
-        self.role = role
-        self.unit_pref = unit_pref
-        self.is_admin = bool(is_admin)
-
-    @staticmethod
-    def from_row(r: sqlite3.Row) -> "User":
-        return User(
-            id=r["id"],
-            email=r["email"],
-            role=r["role"] if "role" in r.keys() else "user",
-            unit_pref=r["unit_pref"] if "unit_pref" in r.keys() else "L",
-            is_admin=bool(r["is_admin"]) if "is_admin" in r.keys() else False,
-        )
-
-@login_manager.user_loader
-def load_user(user_id: str) -> Optional[User]:
-    try:
-        r = query_one(
-            "SELECT id, email, role, unit_pref, is_admin FROM users WHERE id=?",
-            (user_id,)
-        )
-    except sqlite3.OperationalError:
-        # If startup race, try to bootstrap
-        init_db()
-        r = None
-    return User.from_row(r) if r else None
 
 # -----------------------------------------------------------------------------
 # Templates
@@ -421,8 +377,42 @@ TPL_ADMIN = r"""
 {% endblock %}
 """
 
-# Wire base layout for string templates
-app.jinja_loader.mapping = {"base.html": TPL_BASE}
+# Proper Jinja loader
+app.jinja_loader = DictLoader({"base.html": TPL_BASE})
+
+# -----------------------------------------------------------------------------
+# User model / loader
+# -----------------------------------------------------------------------------
+class User(UserMixin):
+    def __init__(self, id: int, email: str, role: str = "user",
+                 unit_pref: str = "L", is_admin: bool = False):
+        self.id = id
+        self.email = email
+        self.role = role
+        self.unit_pref = unit_pref
+        self.is_admin = bool(is_admin)
+
+    @staticmethod
+    def from_row(r: sqlite3.Row) -> "User":
+        return User(
+            id=r["id"],
+            email=r["email"],
+            role=r["role"] if "role" in r.keys() else "user",
+            unit_pref=r["unit_pref"] if "unit_pref" in r.keys() else "L",
+            is_admin=bool(r["is_admin"]) if "is_admin" in r.keys() else False,
+        )
+
+@login_manager.user_loader
+def load_user(user_id: str) -> Optional[User]:
+    try:
+        r = query_one(
+            "SELECT id, email, role, unit_pref, is_admin FROM users WHERE id=?",
+            (user_id,)
+        )
+    except sqlite3.OperationalError:
+        init_db()
+        r = None
+    return User.from_row(r) if r else None
 
 # -----------------------------------------------------------------------------
 # Auth routes
@@ -612,7 +602,7 @@ def admin_claim():
     return redirect(url_for("admin"))
 
 # -----------------------------------------------------------------------------
-# PWA / health
+# PWA / health / debug
 # -----------------------------------------------------------------------------
 @app.route("/manifest.webmanifest")
 def manifest():
@@ -631,26 +621,36 @@ def manifest():
 
 @app.route("/sw.js")
 def service_worker():
+    # No fetch interception to avoid blank-page caching
     resp = Response(
         """
 self.addEventListener('install', event => { self.skipWaiting(); });
 self.addEventListener('activate', event => { event.waitUntil(clients.claim()); });
-// Do NOT intercept HTML navigations; let the network handle them.
-self.addEventListener('fetch', event => {
-  if (event.request.mode === 'navigate') return; // pass-through
-  // pass-through for everything else too (no offline fallback yet)
-  return;
-});
+// No fetch handler
         """,
         mimetype="application/javascript",
     )
     resp.headers["Service-Worker-Allowed"] = "/"
     return resp
 
-
 @app.route("/healthz")
 def healthz():
     return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+
+# Handy debug endpoints
+@app.route("/ping")
+def ping():
+    return "ok"
+
+@app.route("/__whoami")
+def whoami():
+    if current_user.is_authenticated:
+        return {"auth": True, "email": current_user.email, "admin": bool(getattr(current_user, "is_admin", False))}
+    return {"auth": False}
+
+@app.route("/__env")
+def env():
+    return {"db_path": DB_PATH, "cwd": os.getcwd()}
 
 # -----------------------------------------------------------------------------
 # WSGI entry
