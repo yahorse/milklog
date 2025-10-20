@@ -635,14 +635,18 @@ def service_worker():
         """
 self.addEventListener('install', event => { self.skipWaiting(); });
 self.addEventListener('activate', event => { event.waitUntil(clients.claim()); });
+// Do NOT intercept HTML navigations; let the network handle them.
 self.addEventListener('fetch', event => {
-  event.respondWith(fetch(event.request).catch(() => new Response('', {status: 200})));
+  if (event.request.mode === 'navigate') return; // pass-through
+  // pass-through for everything else too (no offline fallback yet)
+  return;
 });
         """,
         mimetype="application/javascript",
     )
     resp.headers["Service-Worker-Allowed"] = "/"
     return resp
+
 
 @app.route("/healthz")
 def healthz():
