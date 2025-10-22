@@ -25,7 +25,7 @@ from jinja2 import DictLoader
 # -----------------------------------------------------------------------------
 # App / Config
 # -----------------------------------------------------------------------------
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 DB_PATH = os.environ.get("DATABASE_PATH", "milklog.db")
 
@@ -1178,10 +1178,31 @@ def manifest():
         "theme_color": "#0f172a",
         "icons": [
             {"src": "/static/icon-192.png", "type": "image/png", "sizes": "192x192"},
-            {"src": "/static/icon-512.png", "type": "image/png", "sizes": "512x512"}
-        ]
-    })
-
+     {"src": "/static/icon-512.png", "type": "image/png", "sizes": "512x512"},
+            {
+                "src": "/static/icon-512-maskable.png",
+                "type": "image/png",
+                "sizes": "512x512",
+                "purpose": "maskable",
+            },
+        ],
+        "screenshots": [
+            {
+                "src": "/static/screens/home-portrait.png",
+                "sizes": "1080x1920",
+                "type": "image/png",
+                "form_factor": "narrow",
+                "label": "Home & recent entries",
+            },
+            {
+                "src": "/static/screens/dashboard-portrait.png",
+                "sizes": "1080x1920",
+                "type": "image/png",
+                "form_factor": "narrow",
+                "label": "90-day dashboard",
+            },
+        ],
+        
 @app.route("/sw.js")
 def service_worker():
     # No fetch interception to avoid blank-page caching
