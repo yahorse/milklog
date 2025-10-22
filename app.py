@@ -164,91 +164,122 @@ init_db()
 # -----------------------------------------------------------------------------
 # Templates (base + pages)
 # -----------------------------------------------------------------------------
-TPL_BASE = r"""
+TPL_BASE = """
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MilkLog</title>
-  <link rel="manifest" href="{{ url_for('manifest') }}">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/static/icon-192.png" sizes="192x192" type="image/png">
+  <link rel="apple-touch-icon" href="/static/icon-512.png">
   <meta name="theme-color" content="#0f172a">
   <style>
-    :root { color-scheme: light dark; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b1220; color:#e5e7eb;}
-    a { color:#93c5fd; text-decoration:none;}
-    header { background:#0a0f1a; border-bottom:1px solid #1f2937; position:sticky; top:0; z-index:10;}
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 1rem; }
-    .nav { display:flex; gap:1rem; align-items:center; flex-wrap:wrap;}
-    .nav .grow { flex:1; }
-    .btn { background:#111827; border:1px solid #374151; padding:0.45rem 0.8rem; border-radius:10px; color:#e5e7eb; cursor:pointer;}
-    .btn:hover { background:#0f172a; }
-    .btn-google { background:#1f2937; border:1px solid #374151; padding:0.55rem 0.9rem; border-radius:10px; display:inline-flex; align-items:center; gap:.5rem;}
-    .card { background:#0b1324; border:1px solid #1f2937; border-radius:14px; padding:1rem; }
-    input, select, textarea { width:100%; background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:10px; padding:0.5rem;}
-    table { width:100%; border-collapse: collapse; }
-    th, td { text-align:left; padding:0.5rem; border-bottom:1px solid #1f2937; vertical-align:top;}
-    .grid { display:grid; gap:1rem; }
-    .grid-2 { grid-template-columns: 1fr 1fr; }
-    .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
-    .muted { color:#94a3b8; }
-    .danger { color:#fda4af; }
-    .success { color:#86efac; }
-    .tag { display:inline-block; padding:0.15rem 0.5rem; border:1px solid #334155; border-radius:999px; margin-right:0.25rem; font-size:0.8rem; color:#93c5fd;}
-    footer { color:#94a3b8; font-size:0.9rem; padding:2rem 0; text-align:center;}
-    .flash { padding:0.5rem 0.75rem; border-radius:10px; margin: 0.25rem 0; }
-    .flash-ok { background:#052e16; border:1px solid #064e3b;}
-    .flash-err { background:#3f1d1d; border:1px solid #7f1d1d;}
-    .row-actions { display:flex; gap:0.5rem; }
-    .center { text-align:center; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background-color: #0b1220;
+      color: #e5e7eb;
+      margin: 0; padding: 0;
+    }
+    nav {
+      background-color: #0f172a;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.5rem 1rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+    }
+    nav .brand {
+      font-weight: 700;
+      color: #93c5fd;
+      text-decoration: none;
+      font-size: 1.2rem;
+    }
+    nav a {
+      color: #e5e7eb;
+      text-decoration: none;
+      margin-right: 1rem;
+      padding: 0.4rem 0.8rem;
+      border-radius: 0.5rem;
+      transition: background-color 0.2s;
+    }
+    nav a:hover {
+      background-color: #1e293b;
+    }
+    nav .right {
+      margin-left: auto;
+    }
+    .container {
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 1rem;
+      background-color: #0f172a;
+      border-radius: 0.75rem;
+      box-shadow: 0 0 10px rgba(0,0,0,0.5);
+    }
+    button, input, select, textarea {
+      background-color: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 0.5rem;
+      color: #e5e7eb;
+      padding: 0.5rem;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    button:hover {
+      background-color: #334155;
+    }
+    .flash {
+      padding: 0.75rem;
+      border-radius: 0.5rem;
+      margin: 1rem 0;
+      background: #064e3b;
+      color: #d1fae5;
+    }
   </style>
 </head>
 <body>
-  <header>
-    <div class="wrap nav">
-      <div><strong>🥛 MilkLog</strong></div>
-      <a class="btn" href="{{ url_for('index') }}">Home</a>
-      <a class="btn" href="{{ url_for('dashboard') }}">Dashboard</a>
-      <a class="btn" href="{{ url_for('pivot') }}">Pivot</a>
-      <a class="btn" href="{{ url_for('cows') }}">Cows</a>
-      <a class="btn" href="{{ url_for('export_csv') }}">Export CSV</a>
-      <div class="grow"></div>
-      {% if current_user.is_authenticated %}
-        {% if current_user.is_admin %}
-          <a class="btn" href="{{ url_for('admin') }}">Admin</a>
-        {% endif %}
-        <form method="post" action="{{ url_for('logout') }}" style="display:inline;">
-          <button class="btn" type="submit">Logout ({{ current_user.email }})</button>
-        </form>
-      {% else %}
-        <a class="btn" href="{{ url_for('login') }}">Login</a>
-        <a class="btn" href="{{ url_for('register') }}">Register</a>
-      {% endif %}
-    </div>
-  </header>
+  <nav>
+    <a href="/" class="brand">🥛 MilkLog</a>
+    {% if current_user.is_authenticated %}
+      <div class="links">
+        <a href="/">Home</a>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/pivot">Pivot</a>
+        <a href="/cows">Cows</a>
+        <a href="/export">Export CSV</a>
+        <a href="/logout" class="right">Logout</a>
+      </div>
+    {% else %}
+      <div class="links">
+        <a href="/login" class="right">Login</a>
+        <a href="/register">Register</a>
+      </div>
+    {% endif %}
+  </nav>
 
-  <main class="wrap">
-    {% with messages = get_flashed_messages(with_categories=true) %}
+  <main class="container">
+    {% with messages = get_flashed_messages() %}
       {% if messages %}
-        {% for cat, msg in messages %}
-          <div class="flash {% if cat=='ok' %}flash-ok{% else %}flash-err{% endif %}">{{ msg }}</div>
+        {% for msg in messages %}
+          <div class="flash">{{ msg }}</div>
         {% endfor %}
       {% endif %}
     {% endwith %}
-    {% block body %}{% endblock %}
-  </main>
 
-  <footer>
-    <div class="wrap">PWA ready. <span class="muted">Add to Home Screen for quick entry.</span></div>
-  </footer>
+    {% block content %}{% endblock %}
+  </main>
 
   <script>
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('{{ url_for("service_worker") }}');
+      navigator.serviceWorker.register('/sw.js').catch(console.error);
     }
   </script>
 </body>
 </html>
 """
+
 
 TPL_HOME = r"""
 {% extends "base.html" %}
