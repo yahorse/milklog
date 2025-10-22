@@ -1169,6 +1169,7 @@ def admin():
 # -----------------------------------------------------------------------------
 @app.route("/manifest.webmanifest")
 def manifest():
+    # Return a valid web manifest JSON structure
     return jsonify({
         "name": "MilkLog",
         "short_name": "MilkLog",
@@ -1178,7 +1179,7 @@ def manifest():
         "theme_color": "#0f172a",
         "icons": [
             {"src": "/static/icon-192.png", "type": "image/png", "sizes": "192x192"},
-     {"src": "/static/icon-512.png", "type": "image/png", "sizes": "512x512"},
+            {"src": "/static/icon-512.png", "type": "image/png", "sizes": "512x512"},
             {
                 "src": "/static/icon-512-maskable.png",
                 "type": "image/png",
@@ -1201,9 +1202,9 @@ def manifest():
                 "form_factor": "narrow",
                 "label": "90-day dashboard",
             },
-            },  
         ],
-        
+    })
+
 @app.route("/sw.js")
 def service_worker():
     # No fetch interception to avoid blank-page caching
