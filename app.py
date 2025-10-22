@@ -268,7 +268,7 @@ TPL_BASE = """
       {% endif %}
     {% endwith %}
 
-    {% block content %}{% endblock %}
+    {% block body %}{% endblock %}
   </main>
 
   <script>
