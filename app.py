@@ -1201,6 +1201,7 @@ def manifest():
                 "form_factor": "narrow",
                 "label": "90-day dashboard",
             },
+            },  
         ],
         
 @app.route("/sw.js")
