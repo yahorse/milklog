@@ -162,6 +162,40 @@ def init_db() -> None:
 init_db()
 
 # -----------------------------------------------------------------------------
+# New helper: claim legacy ownerless rows into a user's account (safe heuristic)
+# -----------------------------------------------------------------------------
+def claim_legacy_rows(user_id: int) -> Tuple[int, int]:
+    """
+    Claim legacy rows (owner_id IS NULL OR 0) into user_id, but only when it's
+    safe to do so: we only claim if the user currently has no milk rows (and/or no cows).
+    Returns tuple (milk_claimed_count, cows_claimed_count).
+    """
+    try:
+        # If user already has milk rows, don't claim (avoid stealing other users' data)
+        user_milk = query_one("SELECT COUNT(*) AS c FROM milk WHERE owner_id=?", (user_id,))
+        if user_milk and user_milk["c"] and user_milk["c"] > 0:
+            return (0, 0)
+
+        legacy_milk = query_one("SELECT COUNT(*) AS c FROM milk WHERE owner_id IS NULL OR owner_id = 0")
+        milk_count = int(legacy_milk["c"]) if legacy_milk and legacy_milk["c"] else 0
+        if milk_count > 0:
+            exec_sql("UPDATE milk SET owner_id=?, updated_at=CURRENT_TIMESTAMP WHERE owner_id IS NULL OR owner_id = 0", (user_id,))
+
+        # Do the same for cows, but only if the user has no cows already
+        user_cows = query_one("SELECT COUNT(*) AS c FROM cows WHERE owner_id=?", (user_id,))
+        cows_count = 0
+        if not (user_cows and user_cows["c"] and user_cows["c"] > 0):
+            legacy_cows = query_one("SELECT COUNT(*) AS c FROM cows WHERE owner_id IS NULL OR owner_id = 0")
+            cows_count = int(legacy_cows["c"]) if legacy_cows and legacy_cows["c"] else 0
+            if cows_count > 0:
+                exec_sql("UPDATE cows SET owner_id=?, updated_at=CURRENT_TIMESTAMP WHERE owner_id IS NULL OR owner_id = 0", (user_id,))
+
+        return (milk_count, cows_count)
+    except Exception:
+        # On any error, don't raise — avoid blocking login — return zeros
+        return (0, 0)
+
+# -----------------------------------------------------------------------------
 # Templates (base + pages)
 # -----------------------------------------------------------------------------
 TPL_BASE = """
@@ -279,7 +313,6 @@ TPL_BASE = """
 </body>
 </html>
 """
-
 
 TPL_HOME = r"""
 {% extends "base.html" %}
@@ -755,6 +788,16 @@ def register():
         )
         user_row = query_one("SELECT id, email, role, unit_pref, is_admin, name, picture FROM users WHERE email=?", (email,))
         login_user(User.from_row(user_row))
+
+        # Claim legacy rows (safe heuristic): only if this user has no rows already
+        try:
+            uid = int(current_user.id)
+            milk_claimed, cows_claimed = claim_legacy_rows(uid)
+            if milk_claimed or cows_claimed:
+                flash(f"Claimed {milk_claimed} legacy milk rows and {cows_claimed} legacy cows into your account.", "ok")
+        except Exception:
+            pass
+
         flash("Welcome to MilkLog!", "ok")
         return redirect(url_for("index"))
     return render_template_string(TPL_REGISTER)
@@ -768,6 +811,16 @@ def login():
         if row and row["password_hash"] and check_password_hash(row["password_hash"], password):
             exec_sql("UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
             login_user(User.from_row(row))
+
+            # Claim legacy rows if user has no data yet
+            try:
+                uid = int(current_user.id)
+                milk_claimed, cows_claimed = claim_legacy_rows(uid)
+                if milk_claimed or cows_claimed:
+                    flash(f"Claimed {milk_claimed} legacy milk rows and {cows_claimed} legacy cows into your account.", "ok")
+            except Exception:
+                pass
+
             flash("Logged in.", "ok")
             return redirect(url_for("index"))
         flash("Invalid credentials.", "err")
@@ -888,6 +941,16 @@ def google_callback():
 
     r = query_one("SELECT id, email, role, unit_pref, is_admin, name, picture FROM users WHERE id=?", (row["id"],))
     login_user(User.from_row(r))
+
+    # Claim legacy rows if user has none already
+    try:
+        uid = int(current_user.id)
+        milk_claimed, cows_claimed = claim_legacy_rows(uid)
+        if milk_claimed or cows_claimed:
+            flash(f"Claimed {milk_claimed} legacy milk rows and {cows_claimed} legacy cows into your account.", "ok")
+    except Exception:
+        pass
+
     flash("Signed in with Google.", "ok")
     return redirect(url_for("index"))
 
