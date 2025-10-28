@@ -283,7 +283,11 @@ TPL_BASE = """
         <a href="/pivot">Pivot</a>
         <a href="/cows">Cows</a>
         <a href="/export">Export CSV</a>
-        <a href="/logout" class="right">Logout</a>
+        <!-- Logout is a POST action; render a small inline form so the route receives POST.
+             The logout route redirects to the login page. -->
+        <form method="post" action="{{ url_for('logout') }}" style="display:inline;margin-left:0.5rem;">
+          <button type="submit" style="background:none;border:none;color:#e5e7eb;cursor:pointer;padding:0.4rem 0.8rem;border-radius:0.5rem;">Logout</button>
+        </form>
       </div>
     {% else %}
       <div class="links">
@@ -717,6 +721,48 @@ TPL_COW_DASH = r"""
         <p class="muted">No entries yet.</p>
       {% endif %}
     </div>
+  </div>
+{% endblock %}
+"""
+
+TPL_ADMIN = r"""
+{% extends "base.html" %}
+{% block body %}
+  <div class="card">
+    <h2>Admin — Users &amp; Cows</h2>
+    {% if user_list %}
+      <table>
+        <thead>
+          <tr><th>User ID</th><th>Email</th><th>Name</th><th>Admin</th><th>Created</th><th>Last Login</th><th>Cows</th></tr>
+        </thead>
+        <tbody>
+          {% for item in user_list %}
+            {% set u = item.user %}
+            <tr>
+              <td>{{ u.id }}</td>
+              <td>{{ u.email }}</td>
+              <td>{{ u.name or '' }}</td>
+              <td>{{ 'Yes' if u.is_admin else 'No' }}</td>
+              <td>{{ u.created_at or '' }}</td>
+              <td>{{ u.last_login or '' }}</td>
+              <td>
+                {% if item.cows %}
+                  <ul style="margin:0;padding-left:1rem;">
+                    {% for c in item.cows %}
+                      <li>{{ c.name }}{% if c.tag %} ({{ c.tag }}){% endif %} — {{ 'Active' if c.active else 'Archived' }}</li>
+                    {% endfor %}
+                  </ul>
+                {% else %}
+                  <span class="muted">No cows</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No users found.</p>
+    {% endif %}
   </div>
 {% endblock %}
 """
@@ -1241,7 +1287,7 @@ def export_csv():
     return Response(generate(), mimetype="text/csv", headers=headers)
 
 # -----------------------------------------------------------------------------
-# Admin — claim legacy rows (unchanged placeholder)
+# Admin — users & cows console
 # -----------------------------------------------------------------------------
 @app.route("/admin")
 @login_required
@@ -1249,14 +1295,24 @@ def admin():
     if not getattr(current_user, "is_admin", False):
         flash("Admin only.", "err")
         return redirect(url_for("index"))
-    rows = query_all("""
-        SELECT *
-        FROM milk
-        WHERE owner_id IS NULL OR owner_id=0
-        ORDER BY created_at DESC
-        LIMIT 500
+
+    users = query_all("""
+        SELECT id, email, name, role, unit_pref, is_admin, created_at, last_login
+          FROM users
+         ORDER BY id ASC
     """)
-    return render_template_string(TPL_PIVOT.replace("Pivot (Daily Totals)", "Admin — Claim Legacy Rows"), rows=rows)
+    user_list = []
+    for u in users:
+        cows = query_all("""
+            SELECT id, name, tag, breed, birth_date, active, created_at
+              FROM cows
+             WHERE owner_id=?
+             ORDER BY active DESC, name ASC
+        """, (u["id"],))
+        # For template ease, convert to simple structures
+        user_list.append({"user": u, "cows": cows})
+
+    return render_template_string(TPL_ADMIN, user_list=user_list)
 
 # -----------------------------------------------------------------------------
 # PWA / health / debug
